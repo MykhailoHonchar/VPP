@@ -1,0 +1,16 @@
+# Build output
+**/bin/
+**/obj/
+vpp_global.Web/dist/
+vpp_global.Web/node_modules/
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Local secrets — never commit real connection strings.
+# appsettings.json (the base file) is NOT ignored here since it's often safe
+# defaults-only, but check it yourself before your first commit — I haven't
+# read either file's contents.
+vpp_global.Api/appsettings.Development.json

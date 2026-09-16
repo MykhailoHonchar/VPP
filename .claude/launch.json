@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vpp-api",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "vpp_global.Api"],
+      "port": 5019
+    },
+    {
+      "name": "vpp-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "vpp_global.Web", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}

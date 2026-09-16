@@ -1,0 +1,35 @@
+.row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+label {
+  font-size: 0.85rem;
+  color: #444;
+}
+
+input {
+  width: 5rem;
+  padding: 0.3rem;
+}
+
+button {
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+}
+
+.log {
+  font-family: monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  padding: 0.5rem;
+  min-height: 2rem;
+  margin-top: 1rem;
+}
+
+canvas {
+  margin-top: 1.5rem;
+}
