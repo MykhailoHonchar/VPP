@@ -85,9 +85,15 @@ public static class DeviceEndpoints
             return Results.Ok(points);
         });
 
-        app.MapGet("/devices/{deviceId:int}/live", async (int deviceId, DateTime? at, IPowerMeterReader meter) =>
+        app.MapGet("/devices/{deviceId:int}/live", async (int deviceId, DateTime? at, IPowerMeterReader meter, SimulationClock clock) =>
         {
-            var timestamp = at ?? DateTime.UtcNow;
+            // Default to the backend's own authoritative simulated clock, not the
+            // caller's guess — a client-supplied `at` for an Accumulator can fall behind
+            // the ramp's own LastTickAt (advanced independently by the ingestion
+            // service's internal tick), which clamps RampedCurrentAt's elapsed time to
+            // zero and returns a frozen value instead of a genuinely live one. Explicit
+            // `at` is still honored for callers that need a specific past/future instant.
+            var timestamp = at ?? clock.Now();
             var kw = await meter.ReadPowerKwAt(deviceId, timestamp);
             return Results.Ok(new { Timestamp = timestamp, PowerKw = kw });
         });
@@ -98,7 +104,26 @@ public static class DeviceEndpoints
         // override flag — deferred until the interactive override UI is built.
         app.MapPost("/devices/{deviceId:int}/battery-mode", (int deviceId, AccumulatorMode mode) =>
             Results.Problem("Manual battery mode override isn't implemented yet.", statusCode: 501));
+
+        // For the /god debug page — instance-level Accumulator (Battery/EV) fields only.
+        // Deliberately does NOT touch AccumulatorModel (MaxChargeKw/RampRateKwPerHour/...):
+        // several batteries share the same Model row in the seed data, so editing it here
+        // would silently change every battery using that model, not just this one.
+        app.MapPut("/devices/{deviceId:int}/accumulator", async (int deviceId, UpdateAccumulatorRequest request, VppDbContext db, CancellationToken ct) =>
+        {
+            var acc = await db.Set<Accumulator>().FirstOrDefaultAsync(a => a.Id == deviceId, ct);
+            if (acc is null) return Results.NotFound("Not a Battery/EV device.");
+            acc.CurrentChargeKWH = request.CurrentChargeKWH;
+            acc.CapacityKWH = request.CapacityKWH;
+            acc.lowKWH = request.LowKWH;
+            acc.maxKWH = request.MaxKWH;
+            acc.minKWH = request.MinKWH;
+            acc.Priority = request.Priority;
+            await db.SaveChangesAsync(ct);
+            return Results.Ok();
+        });
     }
 }
 
 public record GenerateReadingsRequest(int Days);
+public record UpdateAccumulatorRequest(double CurrentChargeKWH, double CapacityKWH, double LowKWH, double MaxKWH, double MinKWH, int Priority);

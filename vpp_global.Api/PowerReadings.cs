@@ -60,7 +60,14 @@ public class SimulatedPowerMeterReader : IPowerMeterReader
     {
         if (!_deviceCache.TryGetValue(deviceId, out var device))
         {
-            device = await _db.Set<Device>().FirstOrDefaultAsync(d => d.Id == deviceId);
+            // During an ingestion tick this reader shares its DbContext with HomeSysLogic,
+            // which already loaded every device on this HomeSystem via Include — checking
+            // the change tracker first (an in-memory scan, no round trip) avoids re-fetching
+            // data that's already sitting in this same context. A standalone caller (e.g.
+            // the bare /devices/{id}/live endpoint, its own fresh scope/context) finds
+            // nothing tracked yet and falls through to the original query, unchanged.
+            device = _db.ChangeTracker.Entries<Device>().Select(e => e.Entity).FirstOrDefault(d => d.Id == deviceId);
+            device ??= await _db.Set<Device>().FirstOrDefaultAsync(d => d.Id == deviceId);
             _deviceCache[deviceId] = device;
         }
         return device;
@@ -71,7 +78,12 @@ public class SimulatedPowerMeterReader : IPowerMeterReader
     {
         if (!_accumulatorCache.TryGetValue(deviceId, out var acc))
         {
-            acc = await _db.Set<Accumulator>().Include(a => a.Model).FirstAsync(a => a.Id == deviceId);
+            // Same reasoning as GetDeviceAsync, but also requires Model to already be
+            // loaded (HomeSysLogic includes it) — otherwise fall back to the original
+            // single query with its Include, so a standalone caller never gets an
+            // accumulator with a null Model.
+            acc = _db.ChangeTracker.Entries<Accumulator>().Select(e => e.Entity).FirstOrDefault(a => a.Id == deviceId && a.Model is not null);
+            acc ??= await _db.Set<Accumulator>().Include(a => a.Model).FirstAsync(a => a.Id == deviceId);
             _accumulatorCache[deviceId] = acc;
         }
         return acc;

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { useParams } from "react-router-dom"
+import { useParams, Link } from "react-router-dom"
 
 import { Chart } from 'chart.js/auto'
 import zoomPlugin from 'chartjs-plugin-zoom'
@@ -9,6 +9,28 @@ Chart.register(zoomPlugin)
 const LIVE_HISTORY_MS = 5 * 24 * 3600 * 1000
 
 const COLORS = ['#16a34a', '#2563eb', '#f59e0b', '#8b5cf6', '#eb4497']
+
+// Mirrors the backend's DispatchStatus enum (HomeSysLogic.cs) — one color per reason the
+// inverter is doing what it's doing right now, used to color the price line by segment.
+const DISPATCH_STATUS_COLORS: Record<string, string> = {
+  SellBatteryFull: '#22c55e',
+  SellHighPrice: '#86efac',
+  SellNoBattery: '#86efac',
+  BuyBatteryEmpty: '#ef4444',
+  BuyLowPrice: '#fca5a5',
+  BuyNoBattery: '#fca5a5',
+  ChargeOffgrid: '#3b82f6',
+  DrainOffgrid: '#a855f7',
+}
+const DISPATCH_STATUS_DEFAULT_COLOR = '#f59e0b'
+const DISPATCH_STATUS_LEGEND: [string, string][] = [
+  ['Sell (battery full)', DISPATCH_STATUS_COLORS.SellBatteryFull],
+  ['Sell (price high)', DISPATCH_STATUS_COLORS.SellHighPrice],
+  ['Buy (battery empty)', DISPATCH_STATUS_COLORS.BuyBatteryEmpty],
+  ['Buy (price low)', DISPATCH_STATUS_COLORS.BuyLowPrice],
+  ['Charge (offgrid)', DISPATCH_STATUS_COLORS.ChargeOffgrid],
+  ['Drain (offgrid)', DISPATCH_STATUS_COLORS.DrainOffgrid],
+]
 
 interface DeviceInfo  {
     id: number
@@ -28,6 +50,7 @@ interface AccumulatorStatus {
 }
 
 interface HomeSystemStatus {
+  timestamp: string
   inverterMode: string
   inverterCurrent: number
   netGridKw: number
@@ -37,6 +60,7 @@ interface HomeSystemStatus {
   activeAccPriority: number
   accumulators: AccumulatorStatus[]
   scenario: string
+  status: string
 }
 
 function HomeSystemPage()
@@ -87,7 +111,12 @@ function HomeSystemPage()
   const [gridNodeId, setGridNodeId] = useState(0)
   const priceChartCanvasRef = useRef<HTMLCanvasElement>(null)
   const priceChartRef = useRef<Chart | null>(null)
-  const priceDataRef = useRef<{ x: number; y: number }[]>([])
+  const priceDataRef = useRef<{ x: number; y: number; status: string }[]>([])
+  // Updated by the (slower, 1s) status poll; read by the (faster, 200ms) price tick so
+  // each price point can be tagged with whatever dispatch status was current at the time —
+  // the price curve itself has no idea about battery/inverter state, so the two have to be
+  // joined this way rather than coming from the same request.
+  const latestDispatchStatusRef = useRef('')
 
   // --- Battery SoC + live-state charts (real wall-clock time, client-side only) ---
   const [socVisible, setSocVisible] = useState<Record<number, boolean>>({})
@@ -231,23 +260,32 @@ function HomeSystemPage()
 
     const tick = async () => {
 
-      simTimeRef.current = new Date(currentSimTimeMs())
-      const at = simTimeRef.current.toISOString()
-
+      // No `at` is sent for /live — each call gets back the backend's own
+      // authoritative SimulationClock reading instead of a client-guessed one. A
+      // guessed `at` that fell behind the accumulator's own last-committed ramp tick
+      // made RampedCurrentAt return a frozen value instead of a live one, which is
+      // what caused the battery line to staircase instead of ramping smoothly.
       const [results, priceRes] = await Promise.all([
         Promise.all(
           devices.map(async (d) => {
-            const [liveRes, predictRes] = await Promise.all([
-              fetch(`/devices/${d.id}/live?at=${at}`),   // ← added ?at=
-              predictEnabledRef.current ? fetch(`/devices/${d.id}/predict?from=${at}&to=${at}`) : Promise.resolve(null),
-            ])
-            const { timestamp, powerKw } = liveRes.ok ? await liveRes.json() : { timestamp: at, powerKw: 0 }
-            const predicted = predictRes && predictRes.ok ? (await predictRes.json())[0] : null
+            const liveRes = await fetch(`/devices/${d.id}/live`)
+            const { timestamp, powerKw } = liveRes.ok
+              ? await liveRes.json()
+              : { timestamp: new Date().toISOString(), powerKw: 0 }
+            // Predict is asked about the exact instant live just reported (not a
+            // separately-guessed one), so the two curves stay directly comparable.
+            const predicted = predictEnabledRef.current
+              ? await fetch(`/devices/${d.id}/predict?from=${timestamp}&to=${timestamp}`)
+                  .then((r) => (r.ok ? r.json() : null))
+                  .then((arr) => arr?.[0] ?? null)
+              : null
             return { id: d.id, timestamp, powerKw, predicted }
           })
         ),
-        gridNodeId ? fetch(`/grid/${gridNodeId}/live?at=${at}`) : Promise.resolve(null),
+        gridNodeId ? fetch(`/grid/${gridNodeId}/live`) : Promise.resolve(null),
       ])
+
+      simTimeRef.current = new Date(results[0]?.timestamp ?? currentSimTimeMs())
 
       let total = 0
       let totalPredicted = 0
@@ -277,7 +315,7 @@ function HomeSystemPage()
 
       if (priceRes && priceRes.ok) {
         const { timestamp, powerKw: price } = await priceRes.json()
-        priceDataRef.current.push({ x: new Date(timestamp).getTime(), y: price })
+        priceDataRef.current.push({ x: new Date(timestamp).getTime(), y: price, status: latestDispatchStatusRef.current })
         while (priceDataRef.current.length && priceDataRef.current[0].x < cutoff) priceDataRef.current.shift()
       }
 
@@ -331,6 +369,13 @@ function HomeSystemPage()
             borderColor: '#f59e0b',
             borderWidth: 2,
             pointRadius: 0,
+            // Colors each segment by the dispatch status in effect at its END point —
+            // one dataset, but the line changes color wherever the reason for buying/
+            // selling/charging/draining changed, instead of a single flat color.
+            segment: {
+              borderColor: (ctx: any) =>
+                DISPATCH_STATUS_COLORS[ctx.p1.raw.status as string] ?? DISPATCH_STATUS_DEFAULT_COLOR,
+            },
           },
         ]
         priceChartRef.current.options.scales!.x!.min = simTimeRef.current.getTime() - LIVE_HISTORY_MS
@@ -415,13 +460,14 @@ function HomeSystemPage()
       const res = await fetch(`/home-systems/${homeSystemId}/status`)
       if (!res.ok) return
       const status: HomeSystemStatus = await res.json()
-      // Timestamped on the same shared simulated clock as the power/price charts, not
-      // real wall-clock time — this data reflects real backend ticks (SoC/Mode can't be
-      // fast-forwarded), but plotting it on the simulated timeline is what makes it
-      // line up with everything else instead of running on its own separate axis.
-      const now = currentSimTimeMs()
+      // Use the backend's own authoritative simulated timestamp for this snapshot,
+      // not the frontend's independently-drifting clock estimate (currentSimTimeMs()) —
+      // that guess and the backend's real SimulationClock never resync after they start,
+      // so plotting on the guess put correct values at a slightly wrong horizontal spot.
+      const now = new Date(status.timestamp).getTime()
       const cutoff = now - LIVE_HISTORY_MS
 
+      latestDispatchStatusRef.current = status.status
       setInverterMode(status.inverterMode)
       setNetGridKw(status.netGridKw)
       setGeneratedKw(status.generatedKw)
@@ -521,6 +567,7 @@ function HomeSystemPage()
         <input type="number" step="0.01" value={simHoursPerTickText} onChange={(e) => setSimHoursPerTickText(e.target.value)} />
       </label>
       <button onClick={handleAnalyze}>Analyze (Live)</button>
+      {' '}<Link to={`/homesystem/${homeSystemId}/god`}>God mode</Link>
       <h2>Home System {homeSystemId}</h2>
 
       <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'flex-start' }}>
@@ -560,6 +607,14 @@ function HomeSystemPage()
         {/* Right column: everything else */}
         <div style={{ flex: 1, minWidth: 0 }}>
           <h3>Power Price</h3>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '0.5rem' }}>
+            {DISPATCH_STATUS_LEGEND.map(([label, color]) => (
+              <span key={label} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.85em' }}>
+                <span style={{ width: '10px', height: '10px', borderRadius: '2px', background: color, display: 'inline-block' }} />
+                {label}
+              </span>
+            ))}
+          </div>
           <div style={{ height: '220px' }}>
             <canvas ref={priceChartCanvasRef}></canvas>
           </div>

@@ -25,6 +25,60 @@ public static class HomeSystemEndpoints
             return hs is null ? Results.NotFound() : Results.Ok(hs);
         });
 
+        app.MapPut("/home-systems/{homeSystemId:int}", async (int homeSystemId, UpdateHomeSystemRequest request, VppDbContext db, CancellationToken ct) =>
+        {
+            var hs = await db.HomeSystems.FirstOrDefaultAsync(h => h.Id == homeSystemId, ct);
+            if (hs is null) return Results.NotFound();
+            hs.lowPrice = request.LowPrice;
+            hs.highPrice = request.HighPrice;
+            await db.SaveChangesAsync(ct);
+            return Results.Ok();
+        });
+
+        // One bundled payload for the /god debug page — every device on this HomeSystem
+        // (with its Simulations) plus the grid node's price Simulations, in one request
+        // instead of the half-dozen small ones the normal page makes. Projected in memory
+        // (after ToListAsync) so `d as Accumulator` can pull out the fields that only
+        // apply to Battery/EV, leaving them null for every other device type.
+        app.MapGet("/home-systems/{homeSystemId:int}/god", async (int homeSystemId, VppDbContext db, CancellationToken ct) =>
+        {
+            var homeSystem = await db.HomeSystems
+                .Where(h => h.Id == homeSystemId)
+                .Select(h => new { h.Id, h.Name, h.GridNodeId, h.lowPrice, h.highPrice })
+                .FirstOrDefaultAsync(ct);
+            if (homeSystem is null) return Results.NotFound();
+
+            var devices = await db.Devices
+                .Where(d => d.HomeSystemId == homeSystemId)
+                .Include(d => d.Simulations)
+                .ToListAsync(ct);
+
+            var deviceDtos = devices.Select(d => new
+            {
+                d.Id,
+                d.Name,
+                Type = d.GetType().Name,
+                CurrentChargeKWH = (d as Accumulator)?.CurrentChargeKWH,
+                CapacityKWH = (d as Accumulator)?.CapacityKWH,
+                LowKWH = (d as Accumulator)?.lowKWH,
+                MaxKWH = (d as Accumulator)?.maxKWH,
+                MinKWH = (d as Accumulator)?.minKWH,
+                Priority = (d as Accumulator)?.Priority,
+                Mode = (d as Accumulator)?.Mode.ToString(),
+                Simulations = d.Simulations.Select(s => new
+                {
+                    s.Id, s.MeanKw, s.AmplitudeKw, s.PeriodHours, s.PhaseShift, s.NoiseStdDevKw, s.AllowNegative
+                }),
+            });
+
+            var priceSimulations = await db.Simulations
+                .Where(s => s.GridNodeId == homeSystem.GridNodeId)
+                .Select(s => new { s.Id, s.MeanKw, s.AmplitudeKw, s.PeriodHours, s.PhaseShift, s.NoiseStdDevKw, s.AllowNegative })
+                .ToListAsync(ct);
+
+            return Results.Ok(new { HomeSystem = homeSystem, Devices = deviceDtos, PriceSimulations = priceSimulations });
+        });
+
         // Deliberately does NOT re-derive generatedKw/acConsumption/InverterCurrent from
         // live meter reads — HomeSysLogic is the single place that decides what's
         // happening, and everything else (this endpoint included) just reflects its
@@ -64,9 +118,15 @@ public static class HomeSystemEndpoints
 
             return Results.Ok(new
             {
+                // The exact simulated instant this snapshot was computed at — lets the
+                // frontend plot these points on the backend's authoritative clock instead
+                // of guessing "now" from its own independently-drifting simulated clock.
+                Timestamp = snapshot?.At ?? DateTime.UtcNow,
                 InverterMode = inverter.InverterMode.ToString(),
                 InverterCurrent = inverter.InverterCurrent,   // magnitude of grid buy/sell, as decided by HomeSysLogic
                 Scenario = snapshot?.Scenario ?? "Unknown (HomeSysLogic hasn't ticked yet)",
+                // Stable key for coloring the price chart by dispatch reason — see DispatchStatus.
+                Status = snapshot?.Status.ToString() ?? "Unknown",
                 NetGridKw = snapshot?.NetGridKw ?? 0,
                 GeneratedKw = snapshot?.GeneratedKw ?? 0,
                 AcConsumption = snapshot?.AcConsumption ?? 0,
@@ -77,3 +137,5 @@ public static class HomeSystemEndpoints
         });
     }
 }
+
+public record UpdateHomeSystemRequest(double LowPrice, double HighPrice);

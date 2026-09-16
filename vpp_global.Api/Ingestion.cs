@@ -52,20 +52,17 @@ public class PowerReadingIngestionService : BackgroundService
             var meter = scope.ServiceProvider.GetRequiredService<IPowerMeterReader>();
             var pricer = scope.ServiceProvider.GetRequiredService<IGridPriceProvider>();
 
-            var regions = await db.Set<Region>().Select(d => d.Id).ToListAsync(stoppingToken);
-            foreach (var regionId in regions)
+            // Flattened from a Region -> GridNode -> HomeSystem nested loop (1 + R + N
+            // round trips just to discover which home systems exist) to a single query —
+            // nothing in the loop body actually needs the region/grid-node grouping, only
+            // final HomeSystem membership. Each round trip to Supabase here costs tens of
+            // ms, so cutting redundant ones directly shortens the real tick period.
+            var homeSystemIds = await db.Set<HomeSystem>().Select(hs => hs.Id).ToListAsync(stoppingToken);
+            foreach (var hsId in homeSystemIds)
             {
-                var gridNodes = await db.Set<GridNode>().Where(gn=>gn.RegionId==regionId).Select(d => d.Id).ToListAsync(stoppingToken);
-                foreach (var nodeId in gridNodes)
-                {
-                    var homeSyss = await db.Set<HomeSystem>().Where(hs=>hs.GridNode.Id==nodeId).Select(hs=>hs.Id).ToListAsync(stoppingToken);
-                    foreach (var hsId in homeSyss)
-                    {
-                        var logic = await HomeSysLogic.CreateAsync(hsId, db, meter, pricer, stoppingToken);
-                        var result = await logic.ReadHomeSysPowerAsync(hsId, now, hoursPerTick);
-                        _status.Set(hsId, new HomeSysSnapshot(result.Scenario, result.NetGridKw, result.GeneratedKw, result.AcConsumption, now));
-                    }
-                }
+                var logic = await HomeSysLogic.CreateAsync(hsId, db, meter, pricer, stoppingToken);
+                var result = await logic.ReadHomeSysPowerAsync(hsId, now, hoursPerTick);
+                _status.Set(hsId, new HomeSysSnapshot(result.Scenario, result.Status, result.NetGridKw, result.GeneratedKw, result.AcConsumption, now));
             }
             await db.SaveChangesAsync(stoppingToken);
         }

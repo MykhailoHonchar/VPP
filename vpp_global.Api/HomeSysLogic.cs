@@ -1,9 +1,16 @@
 using Microsoft.EntityFrameworkCore;
 using vpp_global.Api.Data;
 
+// A stable, colorable key for "why is the inverter doing what it's doing right now" — the
+// free-text Scenario string is for humans; this is for the UI to key a color off of without
+// string-matching. Sell/Buy each split into two reasons because they're triggered by two
+// independent OR'd conditions (battery bound vs price threshold) that the UI wants to tell
+// apart, even though today's dispatch logic only ever picks one InverterMode for both.
+public enum DispatchStatus { SellBatteryFull, SellHighPrice, SellNoBattery, BuyBatteryEmpty, BuyLowPrice, BuyNoBattery, ChargeOffgrid, DrainOffgrid }
+
 public class HomeSysLogic
 {
-    public record HomeSysPowerRes(int HomeSysId, DateTime TimeStamp, List<PowerReading> DevRes, double totalKw, double CurtailedKw, string Scenario, double NetGridKw, double GeneratedKw, double AcConsumption);
+    public record HomeSysPowerRes(int HomeSysId, DateTime TimeStamp, List<PowerReading> DevRes, double totalKw, double CurtailedKw, string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption);
     private readonly VppDbContext db;
     private readonly IPowerMeterReader meter;
     private readonly IGridPriceProvider pricer;
@@ -127,6 +134,7 @@ public class HomeSysLogic
         }
 
         string scenario;
+        DispatchStatus status;
         double netGridKw = generatedKw*inverter.dc2acEfficiency-acConsumption;
         //if we produce enough to cover our demand
 
@@ -138,6 +146,7 @@ public class HomeSysLogic
             {
                 ///sell
                 inverter.InverterMode = InverterMode.Selling;
+                status = DispatchStatus.SellNoBattery;
                 scenario = "Producing enough, no battery — Sell";
             }
 
@@ -149,8 +158,18 @@ public class HomeSysLogic
                 ///drain sell
                 inverter.InverterMode = InverterMode.Selling;
                 firstAcc.targetCurrentKw = 0;   // Idle: no charge/discharge rate, matches the ramp ticking down to 0
-                scenario = "Producing enough, battery charged/price high — Idle & Sell";
-
+                // Battery-full takes precedence in the label even if price is ALSO high
+                // right now — "full" is the more fundamental reason it's not charging.
+                if (firstAcc.CurrentChargeKWH >= firstAcc.maxKWH)
+                {
+                    status = DispatchStatus.SellBatteryFull;
+                    scenario = "Producing enough, battery full — Sell";
+                }
+                else
+                {
+                    status = DispatchStatus.SellHighPrice;
+                    scenario = "Producing enough, price high — Sell";
+                }
             }
             //batt low
             else
@@ -158,6 +177,7 @@ public class HomeSysLogic
                 ///charge offgrid
                 inverter.InverterMode = InverterMode.Offgrid;
                 aa.targetCurrentKw = -Math.Min(aa.Model.MaxChargeKw, netGridKw);   // negative = charging
+                status = DispatchStatus.ChargeOffgrid;
                 scenario = "Producing enough, battery low — Charge (offgrid)";
             }
         }
@@ -168,6 +188,7 @@ public class HomeSysLogic
             {
                 //buy
                 inverter.InverterMode = InverterMode.Buying;
+                status = DispatchStatus.BuyNoBattery;
                 scenario = "Not enough production, no battery — Buy";
             }
             //is batt low?
@@ -176,7 +197,18 @@ public class HomeSysLogic
                 ///buy idle
                 inverter.InverterMode = InverterMode.Buying;
                 lastAcc.targetCurrentKw = 0;   // Idle: no charge/discharge rate
-                scenario = "Not enough production, battery too low — Buy, battery Idle";
+                // Same precedence rule as the sell branch above: battery-empty wins over
+                // price in the label when both happen to hold at once.
+                if (lastAcc.CurrentChargeKWH <= lastAcc.minKWH)
+                {
+                    status = DispatchStatus.BuyBatteryEmpty;
+                    scenario = "Not enough production, battery empty — Buy";
+                }
+                else
+                {
+                    status = DispatchStatus.BuyLowPrice;
+                    scenario = "Not enough production, price low — Buy";
+                }
             }
             //batt ok
             else
@@ -184,6 +216,7 @@ public class HomeSysLogic
                 ///Drain offgrid
                 inverter.InverterMode = InverterMode.Offgrid;
                 aa.targetCurrentKw = Math.Min(aa.Model.MaxDischargeKw, -netGridKw);   // positive = discharging
+                status = DispatchStatus.DrainOffgrid;
                 scenario = "Not enough production, battery ok — Drain (offgrid)";
             }
         }
@@ -213,7 +246,7 @@ public class HomeSysLogic
             await ReadDeviceAsync(acc.Id, isDcContributor: false, isAcConsumer: false);
         }
 
-        return new HomeSysPowerRes(hsId, at, readings, generatedKw, 0, scenario, netGridKw, generatedKw, acConsumption);
+        return new HomeSysPowerRes(hsId, at, readings, generatedKw, 0, scenario, status, netGridKw, generatedKw, acConsumption);
 
 
     }

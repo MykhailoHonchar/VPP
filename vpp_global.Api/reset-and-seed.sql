@@ -118,23 +118,28 @@ new_consumer AS (
 ),
 
 -- Simulations — solar: daily generation curve + slow weekly drift
+-- Aggressive values (see update-simulations-aggressive.sql for the reasoning): peaks at
+-- 6kW at noon, 0 at night, so a future full reset doesn't regress to the old, weak curve.
 sim_solar_daily AS (
     INSERT INTO "Simulations" ("DeviceId", "GridNodeId", "MeanKw", "AmplitudeKw", "PeriodHours", "PhaseShift", "NoiseStdDevKw", "AllowNegative")
-    SELECT "Id", NULL, 2.5, 2.5, 24, -6, 0.3, false FROM new_solar
+    SELECT "Id", NULL, 3, 3, 24, -6, 0.5, false FROM new_solar
 ),
 sim_solar_weekly AS (
     INSERT INTO "Simulations" ("DeviceId", "GridNodeId", "MeanKw", "AmplitudeKw", "PeriodHours", "PhaseShift", "NoiseStdDevKw", "AllowNegative")
-    SELECT "Id", NULL, 0, 0.5, 168, 0, 0.1, false FROM new_solar
+    SELECT "Id", NULL, 0, 0.7, 168, 0, 0.15, false FROM new_solar
 ),
 
 -- Simulations — consumer: daily usage curve + slow weekly drift
+-- Peaks at 8kW at night (already 180 degrees out of phase from solar) so demand
+-- saturates the battery's 5kW discharge cap for hours at a time instead of barely
+-- denting it.
 sim_consumer_daily AS (
     INSERT INTO "Simulations" ("DeviceId", "GridNodeId", "MeanKw", "AmplitudeKw", "PeriodHours", "PhaseShift", "NoiseStdDevKw", "AllowNegative")
-    SELECT "Id", NULL, 1.2, 0.8, 24, 6, 0.2, false FROM new_consumer
+    SELECT "Id", NULL, 4.5, 3.5, 24, 6, 0.4, false FROM new_consumer
 ),
 sim_consumer_weekly AS (
     INSERT INTO "Simulations" ("DeviceId", "GridNodeId", "MeanKw", "AmplitudeKw", "PeriodHours", "PhaseShift", "NoiseStdDevKw", "AllowNegative")
-    SELECT "Id", NULL, 0, 0.3, 168, 12, 0.1, false FROM new_consumer
+    SELECT "Id", NULL, 0, 0.5, 168, 12, 0.15, false FROM new_consumer
 ),
 
 -- Simulations — grid price: daily cycle + sharper peak component + weekly drift

@@ -14,9 +14,12 @@ public static class GridEndpoints
             return Results.Ok(new { Timestamp = timestamp, Price = price });
         });
 
-        app.MapGet("/grid/{gridNodeId:int}/live", async (int gridNodeId, DateTime? at, IGridPriceProvider gridPrice) =>
+        app.MapGet("/grid/{gridNodeId:int}/live", async (int gridNodeId, DateTime? at, IGridPriceProvider gridPrice, SimulationClock clock) =>
         {
-            var timestamp = at ?? DateTime.UtcNow;
+            // Default to the backend's own authoritative simulated clock — see the same
+            // reasoning on /devices/{id}/live. Explicit `at` (used by GridNodePage's own
+            // manually-stepped clock) is still honored unchanged.
+            var timestamp = at ?? clock.Now();
             var kw = await gridPrice.GetPriceAt(gridNodeId, timestamp);
             return Results.Ok(new { Timestamp = timestamp, PowerKw = kw });
         });
