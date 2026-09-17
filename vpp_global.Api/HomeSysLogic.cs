@@ -199,48 +199,27 @@ public class HomeSysLogic
                 scenario = "Not enough production, battery ok — Drain (offgrid)";
             }
         }
- 
-
         double extraACPower = inverter.MaxOutputPower-deliverableAcConsumption;
 
-        // aa/firstAcc/lastAcc are guaranteed non-null in every case below that actually
-        // touches them — the dispatch branches above only reach SellBatteryFull/
-        // SellHighPrice, BuyBatteryEmpty/BuyLowPrice, ChargeOffgrid, or DrainOffgrid when
-        // the relevant accumulator was already confirmed non-null. The compiler can't see
-        // that invariant across the two separate blocks, hence the `!`s below.
         switch(status)
         {
             case DispatchStatus.SellBatteryFull:
             case DispatchStatus.SellNoBattery:
-                // Selling convention: positive. Capped by remaining AC output headroom
-                // (extraACPower), not just by how much DC generation is actually available.
                 inverter.InverterCurrent = Math.Min(netGridKw, extraACPower);
                 break;
             case DispatchStatus.SellHighPrice:
-                // Beyond what generation alone can sell, also discharge the active battery
-                // to sell at this high price — but only if IT (not firstAcc, which only
-                // gated whether we're in this branch at all) actually has spare charge
-                // above its own LowKWH; otherwise leave it idle rather than draining
-                // whichever battery happens to be active for an unrelated reason.
                 double extraDischargeKw = aa!.CurrentChargeKWH > aa.LowKWH
                     ? Math.Clamp(extraACPower - deliverableGeneratedKw*inverter.dc2acEfficiency, 0, aa.Model.MaxDischargeKw)
                     : 0;
                 aa.TargetCurrentKw = extraDischargeKw;
-                // Uses the same extraDischargeKw just committed above, not the battery's
-                // theoretical max rate, so this can't overstate what's actually being sold.
                 inverter.InverterCurrent = Math.Min(netGridKw + extraDischargeKw, extraACPower);
                 break;
             case DispatchStatus.BuyBatteryEmpty:
-                aa!.TargetCurrentKw = 0;   // Idle: the stack's exhausted, nothing left to (dis)charge
-                // Buying convention: negative, matching Accumulator's own
-                // positive=discharge/negative=charge sign convention.
+                aa!.TargetCurrentKw = 0;
                 inverter.InverterCurrent = netGridKw;
                 break;
             case DispatchStatus.BuyLowPrice:
                 aa!.TargetCurrentKw = -Math.Min(aa.Model.MaxChargeKw, extraACPower*inverter.ac2dcEfficiency);
-                // AC-side equivalent of whatever charge rate was just committed above,
-                // negative to match the buying convention — not the battery's theoretical
-                // max, so this can't overstate how much is actually being imported.
                 inverter.InverterCurrent = -Math.Min(extraACPower, -aa.TargetCurrentKw/inverter.ac2dcEfficiency);
                 break;
             case DispatchStatus.BuyNoBattery:
