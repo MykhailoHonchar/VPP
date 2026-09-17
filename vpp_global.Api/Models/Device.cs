@@ -12,12 +12,13 @@ public abstract class Device
 
 
 public enum InverterMode {Offgrid, Selling, Buying}
+public record Curtail (double Gen, double Batt);
 public class Inverter:Device
 {
     public required double InverterCurrent{get;set;} = 0;
     public required int ModelId {get;set;}
-    public required bool onGrid {get;set;} = true;
-    public required bool onAcc {get;set;} = true;
+    public required bool OnGrid {get;set;} = true;
+    public required bool OnAcc {get;set;} = true;
     public required double MaxDCInput{get;set;} 
     public required double MaxOutputPower{get;set;}
     public required double ac2dcEfficiency{get;set;}
@@ -26,6 +27,14 @@ public class Inverter:Device
    // public required bool draining {get;set;} = false;
    public required InverterMode InverterMode{get;set;}
     public required InverterModel InverterModel{get;set;}
+
+
+    public static Curtail valAndCurtail(double maxAC, double maxDC, double maxGen)
+    {
+
+
+        return new Curtail(1,1);
+    }
 }
 
 
@@ -55,11 +64,11 @@ public enum AccumulatorMode {Idle, Charging, Draining, Empty, Full}
 public abstract class Accumulator : Device
 {
     // Signed: positive = discharging/exporting, negative = charging/absorbing, 0 = idle.
-    public required double targetCurrentKw{get;set;} = 0;    // what HomeSysLogic decides this tick
-    public required double appliedCurrentKw{get;set;} = 0;   // the ramp-tracked, actually-applied value
-    public required double maxKWH {get;set;}
-    public required double minKWH {get;set;}
-    public required double lowKWH {get;set;}
+    public required double TargetCurrentKw{get;set;} = 0;    // what HomeSysLogic decides this tick
+    public required double AppliedCurrentKw{get;set;} = 0;   // the ramp-tracked, actually-applied value
+    public required double MaxKWH {get;set;}
+    public required double MinKWH {get;set;}
+    public required double LowKWH {get;set;}
     public required double CurrentChargeKWH { get; set; }
     public required double CapacityKWH {get;set;}
     public DateTime? LastTickAt { get; set; }
@@ -68,17 +77,17 @@ public abstract class Accumulator : Device
     public required int ModelId {get;set;}
     public required AccumulatorModel Model{get;set;}
 
-    // Ramps linearly from appliedCurrentKw toward targetCurrentKw at the model's
+    // Ramps linearly from AppliedCurrentKw toward TargetCurrentKw at the model's
     // RampRateKwPerHour, evaluable at any timestamp — not just tick boundaries — so a
     // meter read at an arbitrary `at` returns a genuinely continuous value instead of a
     // value that only changes once per tick.
     public static double RampedCurrentAt(Accumulator acc, DateTime at)
     {
-        if (acc.LastTickAt is null) return acc.targetCurrentKw;
+        if (acc.LastTickAt is null) return acc.TargetCurrentKw;
         double elapsedHours = Math.Max(0, (at - acc.LastTickAt.Value).TotalHours);
         double maxDelta = acc.Model.RampRateKwPerHour * elapsedHours;
-        double diff = acc.targetCurrentKw - acc.appliedCurrentKw;
-        return acc.appliedCurrentKw + Math.Clamp(diff, -maxDelta, maxDelta);
+        double diff = acc.TargetCurrentKw - acc.AppliedCurrentKw;
+        return acc.AppliedCurrentKw + Math.Clamp(diff, -maxDelta, maxDelta);
     }
 
     // Empty/Full take priority over Charging/Draining whenever the current flow is the
@@ -88,10 +97,10 @@ public abstract class Accumulator : Device
     // whatever Mode already holds when current is zero and it isn't sitting at a bound.
     public static AccumulatorMode ComputeMode(Accumulator acc)
     {
-        if (acc.appliedCurrentKw > 0) return acc.CurrentChargeKWH <= acc.minKWH ? AccumulatorMode.Empty : AccumulatorMode.Draining;
-        if (acc.appliedCurrentKw < 0) return acc.CurrentChargeKWH >= acc.maxKWH ? AccumulatorMode.Full : AccumulatorMode.Charging;
-        if (acc.CurrentChargeKWH <= acc.minKWH) return AccumulatorMode.Empty;
-        if (acc.CurrentChargeKWH >= acc.maxKWH) return AccumulatorMode.Full;
+        if (acc.AppliedCurrentKw > 0) return acc.CurrentChargeKWH <= acc.MinKWH ? AccumulatorMode.Empty : AccumulatorMode.Draining;
+        if (acc.AppliedCurrentKw < 0) return acc.CurrentChargeKWH >= acc.MaxKWH ? AccumulatorMode.Full : AccumulatorMode.Charging;
+        if (acc.CurrentChargeKWH <= acc.MinKWH) return AccumulatorMode.Empty;
+        if (acc.CurrentChargeKWH >= acc.MaxKWH) return AccumulatorMode.Full;
         return acc.Mode;
     }
 }

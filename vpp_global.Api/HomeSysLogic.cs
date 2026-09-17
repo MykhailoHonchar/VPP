@@ -10,7 +10,17 @@ public enum DispatchStatus { SellBatteryFull, SellHighPrice, SellNoBattery, BuyB
 
 public class HomeSysLogic
 {
-    public record HomeSysPowerRes(int HomeSysId, DateTime TimeStamp, List<PowerReading> DevRes, double totalKw, double CurtailedKw, string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption);
+    // Trimmed to the fields Ingestion.cs (the only caller) actually reads. It used to also
+    // carry HomeSysId/TimeStamp/DevRes (the caller already has `hsId`/`now`, and every
+    // PowerReading is persisted via db.Add regardless of whether it's returned here) plus
+    // totalKw (always just a copy of GeneratedKw) and CurtailedKw (always hardcoded 0).
+    // GeneratedKw/AcConsumption are the true measured ("pure") values, uncurtailed.
+    // DeliverableGeneratedKw/DeliverableAcConsumption are those same two quantities after
+    // clamping to the inverter's MaxDCInput/MaxOutputPower — still in their native DC/AC
+    // domains respectively, for comparing directly against the raw per-device curves.
+    // ActualGenerationKw is DeliverableGeneratedKw converted to AC (DeliverableGeneratedKw
+    // * dc2acEfficiency) — a third, separate quantity, not a duplicate of either.
+    public record HomeSysPowerRes(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, bool Overloaded, bool Overgenerating);
     private readonly VppDbContext db;
     private readonly IPowerMeterReader meter;
     private readonly IGridPriceProvider pricer;
@@ -42,7 +52,7 @@ public class HomeSysLogic
         homeSystem = _homeSystem;
         inverter = _inverter;
     }
-    public async Task<HomeSysPowerRes> ReadHomeSysPowerAsync(int hsId, DateTime at, double hoursPerTick)
+    public async Task<HomeSysPowerRes> ReadHomeSysPowerAsync(DateTime at, double hoursPerTick)
     {
         double generatedKw = 0;
         double acConsumption = 0;
@@ -65,61 +75,32 @@ public class HomeSysLogic
         foreach (var g in homeSystem.Generators) await ReadDeviceAsync(g.Id, isDcContributor: true, isAcConsumer: false);
         foreach (var c in homeSystem.Consumers) await ReadDeviceAsync(c.Id, isDcContributor: false, isAcConsumer: true);
 
-        if(acConsumption>inverter.MaxOutputPower)
-        {
-            //ACHTUNG: OVERLOAD!!!!!!!!!!!!!
+        bool overloaded = acConsumption > inverter.MaxOutputPower;
+        bool overgenerating = generatedKw > inverter.MaxDCInput;
+        double deliverableAcConsumption = overloaded ? inverter.MaxOutputPower : acConsumption;
+        double deliverableGeneratedKw = overgenerating ? inverter.MaxDCInput : generatedKw;
 
-            //idk, just limit or do something?
-        }
-        if(generatedKw>inverter.InverterModel.MaxDcInputKw)
-        {
-            //ACHTUNG: OVERGENERATION!!!!!!!!!!!!!
-
-            //idk, just limit or do something?
-        }
         var powerPrice = await pricer.GetPriceAt(homeSystem.GridNodeId, at);
+        var allAccumulators = homeSystem.Batteries.Cast<Accumulator>().Concat(homeSystem.EVs).ToList();
+        int maxPriority = allAccumulators.Count > 0 ? allAccumulators.Max(a => a.Priority) : 0;
 
-//TEMP!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        int maxPriority = 2;
-
-
-        Accumulator? aa = homeSystem.Batteries
-            .Cast<Accumulator>()
-            .Concat(homeSystem.EVs)
-            .SingleOrDefault(a => a.Priority == homeSystem.ActiveAccPriority);
-
-
-        Accumulator? firstAcc = homeSystem.Batteries
-            .Cast<Accumulator>()
-            .Concat(homeSystem.EVs)
-            .SingleOrDefault(a => a.Priority == 0);
-
-        Accumulator? lastAcc = homeSystem.Batteries
-            .Cast<Accumulator>()
-            .Concat(homeSystem.EVs)
-            .SingleOrDefault(a => a.Priority == maxPriority);
+        Accumulator? aa = allAccumulators.SingleOrDefault(a => a.Priority == homeSystem.ActiveAccPriority);
+        Accumulator? firstAcc = allAccumulators.SingleOrDefault(a => a.Priority == 0);
+        Accumulator? lastAcc = allAccumulators.SingleOrDefault(a => a.Priority == maxPriority);
 
         ///switch to next batt?
         Accumulator changeCell(bool next, Accumulator acc)
         {
-            Accumulator? nextAA = homeSystem.Batteries
-                .Cast<Accumulator>()
-                .Concat(homeSystem.EVs)
-                .SingleOrDefault(a => a.Priority == homeSystem.ActiveAccPriority + (next ? 1 : -1));
+            Accumulator? nextAA = allAccumulators.SingleOrDefault(a => a.Priority == homeSystem.ActiveAccPriority + (next ? 1 : -1));
 
             if (nextAA is not null)
             {
-                acc.targetCurrentKw = 0;   // stop commanding the outgoing cell — it's no longer active, or it'd stay flatlined at its last rate forever
+                acc.TargetCurrentKw = 0;  
                 homeSystem.ActiveAccPriority += next ? 1 : -1;
                 return nextAA;
             }
             return acc;
         }
-
-        // Mode already reflects Empty/Full (computed and persisted at the end of last
-        // tick's ramp loop below) — checking it directly here, instead of re-deriving the
-        // same "pinned against the bound" condition from appliedCurrentKw/CurrentChargeKWH
-        // again, keeps there being exactly one place that decides what Empty/Full means.
         if(aa is not null && aa.Mode == AccumulatorMode.Empty && homeSystem.ActiveAccPriority!=maxPriority)
         {
             //drain next
@@ -135,7 +116,7 @@ public class HomeSysLogic
 
         string scenario;
         DispatchStatus status;
-        double netGridKw = generatedKw*inverter.dc2acEfficiency-acConsumption;
+        double netGridKw = deliverableGeneratedKw*inverter.dc2acEfficiency-deliverableAcConsumption;
         //if we produce enough to cover our demand
 
 
@@ -153,20 +134,19 @@ public class HomeSysLogic
 
 
             //is batt ok?
-            else if(firstAcc.CurrentChargeKWH > firstAcc.lowKWH && (firstAcc.CurrentChargeKWH >= firstAcc.maxKWH || powerPrice > homeSystem.highPrice))
+            else if(firstAcc.CurrentChargeKWH > firstAcc.LowKWH && (firstAcc.CurrentChargeKWH >= firstAcc.MaxKWH || powerPrice > homeSystem.HighPrice))
             {
-                ///drain sell
                 inverter.InverterMode = InverterMode.Selling;
-                firstAcc.targetCurrentKw = 0;   // Idle: no charge/discharge rate, matches the ramp ticking down to 0
-                // Battery-full takes precedence in the label even if price is ALSO high
-                // right now — "full" is the more fundamental reason it's not charging.
-                if (firstAcc.CurrentChargeKWH >= firstAcc.maxKWH)
+                firstAcc.TargetCurrentKw = 0;
+                if (firstAcc.CurrentChargeKWH >= firstAcc.MaxKWH)
                 {
+                    //sell full
                     status = DispatchStatus.SellBatteryFull;
                     scenario = "Producing enough, battery full — Sell";
                 }
                 else
                 {
+                    //drain sell
                     status = DispatchStatus.SellHighPrice;
                     scenario = "Producing enough, price high — Sell";
                 }
@@ -176,7 +156,6 @@ public class HomeSysLogic
             {
                 ///charge offgrid
                 inverter.InverterMode = InverterMode.Offgrid;
-                aa.targetCurrentKw = -Math.Min(aa.Model.MaxChargeKw, netGridKw);   // negative = charging
                 status = DispatchStatus.ChargeOffgrid;
                 scenario = "Producing enough, battery low — Charge (offgrid)";
             }
@@ -192,20 +171,21 @@ public class HomeSysLogic
                 scenario = "Not enough production, no battery — Buy";
             }
             //is batt low?
-            else if(lastAcc.CurrentChargeKWH < lastAcc.lowKWH &&(lastAcc.CurrentChargeKWH <= lastAcc.minKWH || powerPrice < homeSystem.lowPrice))
+            else if(lastAcc.CurrentChargeKWH < lastAcc.LowKWH &&(lastAcc.CurrentChargeKWH <= lastAcc.MinKWH || powerPrice < homeSystem.LowPrice))
             {
                 ///buy idle
                 inverter.InverterMode = InverterMode.Buying;
-                lastAcc.targetCurrentKw = 0;   // Idle: no charge/discharge rate
-                // Same precedence rule as the sell branch above: battery-empty wins over
-                // price in the label when both happen to hold at once.
-                if (lastAcc.CurrentChargeKWH <= lastAcc.minKWH)
+                
+               
+                if (lastAcc.CurrentChargeKWH <= lastAcc.MinKWH)
                 {
+                     //force buy
                     status = DispatchStatus.BuyBatteryEmpty;
                     scenario = "Not enough production, battery empty — Buy";
                 }
                 else
                 {
+                    //buy cheap
                     status = DispatchStatus.BuyLowPrice;
                     scenario = "Not enough production, price low — Buy";
                 }
@@ -215,42 +195,81 @@ public class HomeSysLogic
             {
                 ///Drain offgrid
                 inverter.InverterMode = InverterMode.Offgrid;
-                aa.targetCurrentKw = Math.Min(aa.Model.MaxDischargeKw, -netGridKw);   // positive = discharging
                 status = DispatchStatus.DrainOffgrid;
                 scenario = "Not enough production, battery ok — Drain (offgrid)";
             }
         }
+ 
 
+        double extraACPower = inverter.MaxOutputPower-deliverableAcConsumption;
 
-        inverter.InverterCurrent =
-        inverter.InverterMode == InverterMode.Offgrid ?  0 :
-            netGridKw > 0 ?
-                netGridKw*inverter.dc2acEfficiency :
-                    netGridKw*inverter.ac2dcEfficiency;
-
-        // Ramp/SoC-advance runs LAST, after dispatch — not before — so a target changed
-        // by dispatch THIS tick starts being ramped toward THIS tick, not next. Running
-        // it first (the previous ordering) meant any new decision sat for a full tick
-        // before the ramp even started reacting to it.
-        foreach (var acc in homeSystem.Batteries.Cast<Accumulator>().Concat(homeSystem.EVs))
+        // aa/firstAcc/lastAcc are guaranteed non-null in every case below that actually
+        // touches them — the dispatch branches above only reach SellBatteryFull/
+        // SellHighPrice, BuyBatteryEmpty/BuyLowPrice, ChargeOffgrid, or DrainOffgrid when
+        // the relevant accumulator was already confirmed non-null. The compiler can't see
+        // that invariant across the two separate blocks, hence the `!`s below.
+        switch(status)
         {
-            double oldApplied = acc.appliedCurrentKw;
+            case DispatchStatus.SellBatteryFull:
+            case DispatchStatus.SellNoBattery:
+                // Selling convention: positive. Capped by remaining AC output headroom
+                // (extraACPower), not just by how much DC generation is actually available.
+                inverter.InverterCurrent = Math.Min(netGridKw, extraACPower);
+                break;
+            case DispatchStatus.SellHighPrice:
+                // Beyond what generation alone can sell, also discharge the active battery
+                // to sell at this high price — but only if IT (not firstAcc, which only
+                // gated whether we're in this branch at all) actually has spare charge
+                // above its own LowKWH; otherwise leave it idle rather than draining
+                // whichever battery happens to be active for an unrelated reason.
+                double extraDischargeKw = aa!.CurrentChargeKWH > aa.LowKWH
+                    ? Math.Clamp(extraACPower - deliverableGeneratedKw*inverter.dc2acEfficiency, 0, aa.Model.MaxDischargeKw)
+                    : 0;
+                aa.TargetCurrentKw = extraDischargeKw;
+                // Uses the same extraDischargeKw just committed above, not the battery's
+                // theoretical max rate, so this can't overstate what's actually being sold.
+                inverter.InverterCurrent = Math.Min(netGridKw + extraDischargeKw, extraACPower);
+                break;
+            case DispatchStatus.BuyBatteryEmpty:
+                aa!.TargetCurrentKw = 0;   // Idle: the stack's exhausted, nothing left to (dis)charge
+                // Buying convention: negative, matching Accumulator's own
+                // positive=discharge/negative=charge sign convention.
+                inverter.InverterCurrent = netGridKw;
+                break;
+            case DispatchStatus.BuyLowPrice:
+                aa!.TargetCurrentKw = -Math.Min(aa.Model.MaxChargeKw, extraACPower*inverter.ac2dcEfficiency);
+                // AC-side equivalent of whatever charge rate was just committed above,
+                // negative to match the buying convention — not the battery's theoretical
+                // max, so this can't overstate how much is actually being imported.
+                inverter.InverterCurrent = -Math.Min(extraACPower, -aa.TargetCurrentKw/inverter.ac2dcEfficiency);
+                break;
+            case DispatchStatus.BuyNoBattery:
+                inverter.InverterCurrent = netGridKw;
+                break;
+            case DispatchStatus.ChargeOffgrid:
+                inverter.InverterCurrent = 0;
+                aa!.TargetCurrentKw = -Math.Min(aa.Model.MaxChargeKw, netGridKw);
+                break;
+            case DispatchStatus.DrainOffgrid:
+                inverter.InverterCurrent = 0;
+                aa!.TargetCurrentKw = Math.Min(aa.Model.MaxDischargeKw, -netGridKw/inverter.dc2acEfficiency);
+                break;
+        }
+
+
+        foreach (var acc in allAccumulators)
+        {
+            double oldApplied = acc.AppliedCurrentKw;
             double newApplied = Accumulator.RampedCurrentAt(acc, at);
-            acc.appliedCurrentKw = newApplied;
+            acc.AppliedCurrentKw = newApplied;
 
             double avgAppliedKw = (oldApplied + newApplied) / 2;   // trapezoidal — exact for a linear ramp
-            acc.CurrentChargeKWH = Math.Clamp(acc.CurrentChargeKWH - avgAppliedKw * hoursPerTick, acc.minKWH, acc.maxKWH);
+            acc.CurrentChargeKWH = Math.Clamp(acc.CurrentChargeKWH - avgAppliedKw * hoursPerTick, acc.MinKWH, acc.MaxKWH);
             acc.LastTickAt = at;
             acc.Mode = Accumulator.ComputeMode(acc);
 
             await ReadDeviceAsync(acc.Id, isDcContributor: false, isAcConsumer: false);
         }
-
-        return new HomeSysPowerRes(hsId, at, readings, generatedKw, 0, scenario, status, netGridKw, generatedKw, acConsumption);
-
-
+        return new HomeSysPowerRes(scenario, status, netGridKw, generatedKw, acConsumption, deliverableGeneratedKw, deliverableAcConsumption, deliverableGeneratedKw * inverter.dc2acEfficiency, overloaded, overgenerating);
     }
-
-
-
 }

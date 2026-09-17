@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using vpp_global.Api.Data;
@@ -11,9 +12,11 @@ using vpp_global.Api.Data;
 namespace vpp_global.Api.Migrations
 {
     [DbContext(typeof(VppDbContext))]
-    partial class VppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260917072620_RenamePropertiesToPascalCase")]
+    partial class RenamePropertiesToPascalCase
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

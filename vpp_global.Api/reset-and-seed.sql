@@ -1,6 +1,6 @@
 -- Wipes every table and rebuilds exactly one complete, working home system:
 -- Region -> GridNode -> HomeSystem -> Inverter, 1 solar panel, 3 batteries
--- (priorities 0/1/2, matching HomeSysLogic.cs's current maxPriority = 2),
+-- (priorities 0/1/2 — HomeSysLogic.cs derives its own maxPriority from whatever's here),
 -- 1 consumer, plus Simulation rows for solar/consumer/grid price.
 --
 -- RESTART IDENTITY resets every auto-increment counter to 1, so this new
@@ -37,7 +37,7 @@ new_grid_node AS (
     RETURNING "Id"
 ),
 new_home_system AS (
-    INSERT INTO "HomeSystems" ("Name", "GridNodeId", "lowPrice", "highPrice")
+    INSERT INTO "HomeSystems" ("Name", "GridNodeId", "LowPrice", "HighPrice")
     SELECT 'Test Home System', "Id", 0.15, 0.35 FROM new_grid_node
     RETURNING "Id"
 ),
@@ -72,7 +72,7 @@ new_inverter AS (
     INSERT INTO "Devices"
         ("Discriminator", "HomeSystemId", "Name", "Inverter_ModelId",
          "InverterCurrent", "InverterMode", "MaxDCInput", "MaxOutputPower",
-         "ac2dcEfficiency", "dc2acEfficiency", "onAcc", "onGrid")
+         "ac2dcEfficiency", "dc2acEfficiency", "OnAcc", "OnGrid")
     SELECT 'Inverter', hs."Id", 'Inverter 1', im."Id",
            0, 0, 6.0, 5.0,
            0.97, 0.97, true, true
@@ -89,7 +89,7 @@ new_solar AS (
 new_battery_1 AS (
     INSERT INTO "Devices" ("Discriminator", "HomeSystemId", "Name", "Accumulator_ModelId",
                             "CapacityKWH", "CurrentChargeKWH", "LastTickAt", "Mode", "Priority",
-                            "appliedCurrentKw", "targetCurrentKw", "lowKWH", "maxKWH", "minKWH", "Chemistry")
+                            "AppliedCurrentKw", "TargetCurrentKw", "LowKWH", "MaxKWH", "MinKWH", "Chemistry")
     SELECT 'Battery', hs."Id", 'Battery 1', am."Id", 100, 100, NULL, 4, 0, 0, 0, 20, 95, 5, 'LiFePO4'
     FROM new_home_system hs, new_accumulator_model am
     RETURNING "Id"
@@ -97,7 +97,7 @@ new_battery_1 AS (
 new_battery_2 AS (
     INSERT INTO "Devices" ("Discriminator", "HomeSystemId", "Name", "Accumulator_ModelId",
                             "CapacityKWH", "CurrentChargeKWH", "LastTickAt", "Mode", "Priority",
-                            "appliedCurrentKw", "targetCurrentKw", "lowKWH", "maxKWH", "minKWH", "Chemistry")
+                            "AppliedCurrentKw", "TargetCurrentKw", "LowKWH", "MaxKWH", "MinKWH", "Chemistry")
     SELECT 'Battery', hs."Id", 'Battery 2', am."Id", 100, 100, NULL, 4, 1, 0, 0, 20, 95, 5, 'LiFePO4'
     FROM new_home_system hs, new_accumulator_model am
     RETURNING "Id"
@@ -105,7 +105,7 @@ new_battery_2 AS (
 new_battery_3 AS (
     INSERT INTO "Devices" ("Discriminator", "HomeSystemId", "Name", "Accumulator_ModelId",
                             "CapacityKWH", "CurrentChargeKWH", "LastTickAt", "Mode", "Priority",
-                            "appliedCurrentKw", "targetCurrentKw", "lowKWH", "maxKWH", "minKWH", "Chemistry")
+                            "AppliedCurrentKw", "TargetCurrentKw", "LowKWH", "MaxKWH", "MinKWH", "Chemistry")
     SELECT 'Battery', hs."Id", 'Battery 3', am."Id", 100, 100, NULL, 4, 2, 0, 0, 20, 95, 5, 'LiFePO4'
     FROM new_home_system hs, new_accumulator_model am
     RETURNING "Id"

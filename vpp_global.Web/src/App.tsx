@@ -2,10 +2,9 @@ import { useState, useRef, useEffect } from 'react'
 import{ Chart } from 'chart.js/auto'
 import zoomPlugin from 'chartjs-plugin-zoom'
 import './App.css'
+import { COLORS } from './colors'
 
 Chart.register(zoomPlugin)
-
-const COLORS = ['#16a34a', '#2563eb', '#f59e0b', '#8b5cf6', '#eb4497']
 
 function App() {
 
@@ -169,22 +168,27 @@ function App() {
       },
     })
 
-    const intervalId = setInterval(async () => {
-      simTimeRef.current = new Date(simTimeRef.current.getTime() + simHoursPerTick * 3600 * 1000)
-      const at = simTimeRef.current.toISOString()
-
+    // No `at` is sent for /live — each call gets back the backend's own authoritative
+    // SimulationClock reading instead of a client-guessed one (see HomeSystemPage.tsx's
+    // tick() for why: a guessed `at` that fell behind an accumulator's last-committed
+    // ramp tick made the live read return a frozen value instead of a genuinely live
+    // one). /predict then asks about that same returned instant, not a separate guess.
+    const tick = async () => {
       const results = await Promise.all(
         deviceIds.map(async (id) => {
-          const [liveRes, predictRes] = await Promise.all([
-            fetch(`/devices/${id}/live?at=${at}`),
-            predictEnabledRef.current ? fetch(`/devices/${id}/predict?from=${at}&to=${at}`) : Promise.resolve(null),
-          ])
-
+          const liveRes = await fetch(`/devices/${id}/live`)
           const live = liveRes.ok ? await liveRes.json() : null
-          const predicted = predictRes && predictRes.ok ? (await predictRes.json())[0] : null
+          const predicted = predictEnabledRef.current && live
+            ? await fetch(`/devices/${id}/predict?from=${live.timestamp}&to=${live.timestamp}`)
+                .then((r) => (r.ok ? r.json() : null))
+                .then((arr) => arr?.[0] ?? null)
+            : null
           return { id, live, predicted }
         })
       )
+
+      simTimeRef.current = new Date(results.find((r) => r.live)?.live.timestamp ?? simTimeRef.current)
+      const at = simTimeRef.current.toISOString()
 
       let totalLive = 0
       let totalPredicted = 0
@@ -238,10 +242,34 @@ function App() {
         liveChartRef.current.options.scales!.x!.max = simTimeRef.current.getTime()
         liveChartRef.current.update()
       }
-    }, 200)
+    }
 
-    return () => clearInterval(intervalId)
-  }, [isLive, deviceIdInput, simHoursPerTick])
+    // Self-scheduling instead of setInterval: waits for one tick to fully finish before
+    // scheduling the next, so a slow round-trip can't let two ticks overlap and resolve
+    // out of order (same reasoning as HomeSystemPage.tsx's tick loop).
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout>
+    const scheduleNext = () => { if (!cancelled) timeoutId = setTimeout(runTick, 200) }
+    const runTick = () => { tick().finally(scheduleNext) }
+    runTick()
+    return () => { cancelled = true; clearTimeout(timeoutId) }
+    // deviceIds is re-derived from deviceIdInput every render (new array reference each
+    // time), so depending on it directly would tear down and rebuild this effect on
+    // every render; deviceIdInput already covers the same change. LIVE_HISTORY_MS is a
+    // module-level constant, never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLive, deviceIdInput])
+
+  // The backend's SimulationClock is a global singleton shared by every page — posting
+  // here keeps this page's speed control consistent with HomeSystemPage.tsx's, since
+  // /live no longer takes a client-guessed `at` for this page to drive itself.
+  useEffect(() => {
+    fetch('/simulation/speed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hoursPerTick: simHoursPerTick }),
+    })
+  }, [simHoursPerTick])
 
   async function handleLiveAnalyze() {
     for (const id of deviceIds) {

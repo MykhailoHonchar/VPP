@@ -85,7 +85,7 @@ public static class DeviceEndpoints
             return Results.Ok(points);
         });
 
-        app.MapGet("/devices/{deviceId:int}/live", async (int deviceId, DateTime? at, IPowerMeterReader meter, SimulationClock clock) =>
+        app.MapGet("/devices/{deviceId:int}/live", async (int deviceId, DateTime? at, IPowerMeterReader meter, SimulationClock clock, VppDbContext db, CancellationToken ct) =>
         {
             // Default to the backend's own authoritative simulated clock, not the
             // caller's guess — a client-supplied `at` for an Accumulator can fall behind
@@ -95,11 +95,35 @@ public static class DeviceEndpoints
             // `at` is still honored for callers that need a specific past/future instant.
             var timestamp = at ?? clock.Now();
             var kw = await meter.ReadPowerKwAt(deviceId, timestamp);
+
+            // Curtail Generator/Consumer readings against the home system's inverter
+            // limits right here, so the main chart's existing device line already shows
+            // the limited value directly — no separate "deliverable" line needed, and no
+            // approximation: it's the exact same reading the chart already fetched, just
+            // clamped. HomeSysLogic's own internal reads go through IPowerMeterReader
+            // directly (not this endpoint), so they stay the true, uncurtailed measurement
+            // that "Pure Gen"/"Consumption" on the Live State panel report.
+            // Only correct today because there's exactly one Generator and one Consumer
+            // per HomeSystem — with more than one of either, the inverter's limit applies
+            // to their sum, not to each independently.
+            var device = await db.Set<Device>().FirstOrDefaultAsync(d => d.Id == deviceId, ct);
+            if (device is Generator or Consumer)
+            {
+                var inverter = await db.Set<Inverter>()
+                    .FirstOrDefaultAsync(i => i.HomeSystemId == device.HomeSystemId, ct);
+                if (inverter is not null)
+                {
+                    kw = device is Generator
+                        ? Math.Min(kw, inverter.MaxDCInput)
+                        : Math.Max(kw, -inverter.MaxOutputPower);   // Consumer reads negative
+                }
+            }
+
             return Results.Ok(new { Timestamp = timestamp, PowerKw = kw });
         });
 
-        // Not functional: Mode is now derived from appliedCurrentKw's sign (see
-        // Accumulator.Mode), and HomeSysLogic overwrites targetCurrentKw every tick
+        // Not functional: Mode is now derived from AppliedCurrentKw's sign (see
+        // Accumulator.Mode), and HomeSysLogic overwrites TargetCurrentKw every tick
         // regardless. A real manual override needs HomeSysLogic itself to respect an
         // override flag — deferred until the interactive override UI is built.
         app.MapPost("/devices/{deviceId:int}/battery-mode", (int deviceId, AccumulatorMode mode) =>
@@ -115,9 +139,9 @@ public static class DeviceEndpoints
             if (acc is null) return Results.NotFound("Not a Battery/EV device.");
             acc.CurrentChargeKWH = request.CurrentChargeKWH;
             acc.CapacityKWH = request.CapacityKWH;
-            acc.lowKWH = request.LowKWH;
-            acc.maxKWH = request.MaxKWH;
-            acc.minKWH = request.MinKWH;
+            acc.LowKWH = request.LowKWH;
+            acc.MaxKWH = request.MaxKWH;
+            acc.MinKWH = request.MinKWH;
             acc.Priority = request.Priority;
             await db.SaveChangesAsync(ct);
             return Results.Ok();

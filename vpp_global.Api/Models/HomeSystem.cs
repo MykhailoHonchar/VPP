@@ -8,8 +8,8 @@ public class HomeSystem
     public required int GridNodeId{get;set;}
     public required GridNode GridNode{get;set;}
 
-    public required double lowPrice{get;set;}
-    public required double highPrice{get;set;}
+    public required double LowPrice{get;set;}
+    public required double HighPrice{get;set;}
 
     // Which accumulator priority is currently active for charge/discharge dispatch.
     // Must be stored here, not on HomeSysLogic — that class is recreated fresh every

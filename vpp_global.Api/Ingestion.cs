@@ -26,8 +26,8 @@ public class PowerReadingIngestionService : BackgroundService
             var accumulators = await startupDb.Set<Accumulator>().ToListAsync(stoppingToken);
             foreach (var acc in accumulators)
             {
-                acc.targetCurrentKw = 0;
-                acc.appliedCurrentKw = 0;
+                acc.TargetCurrentKw = 0;
+                acc.AppliedCurrentKw = 0;
                 acc.CurrentChargeKWH = acc.CapacityKWH;
                 acc.LastTickAt = null;
                 acc.Mode = AccumulatorMode.Full;   // matches CurrentChargeKWH = CapacityKWH, rather than waiting for the first tick's ComputeMode to catch up
@@ -61,8 +61,8 @@ public class PowerReadingIngestionService : BackgroundService
             foreach (var hsId in homeSystemIds)
             {
                 var logic = await HomeSysLogic.CreateAsync(hsId, db, meter, pricer, stoppingToken);
-                var result = await logic.ReadHomeSysPowerAsync(hsId, now, hoursPerTick);
-                _status.Set(hsId, new HomeSysSnapshot(result.Scenario, result.Status, result.NetGridKw, result.GeneratedKw, result.AcConsumption, now));
+                var result = await logic.ReadHomeSysPowerAsync(now, hoursPerTick);
+                _status.Set(hsId, new HomeSysSnapshot(result.Scenario, result.Status, result.NetGridKw, result.GeneratedKw, result.AcConsumption, result.DeliverableGeneratedKw, result.DeliverableAcConsumption, result.ActualGenerationKw, result.Overloaded, result.Overgenerating, now));
             }
             await db.SaveChangesAsync(stoppingToken);
         }

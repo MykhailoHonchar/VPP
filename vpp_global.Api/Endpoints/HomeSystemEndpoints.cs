@@ -20,7 +20,7 @@ public static class HomeSystemEndpoints
         {
             var hs = await db.HomeSystems
                 .Where(h => h.Id == homeSystemId)
-                .Select(h => new { h.Id, h.Name, h.GridNodeId, h.lowPrice, h.highPrice })
+                .Select(h => new { h.Id, h.Name, h.GridNodeId, h.LowPrice, h.HighPrice })
                 .FirstOrDefaultAsync(ct);
             return hs is null ? Results.NotFound() : Results.Ok(hs);
         });
@@ -29,8 +29,8 @@ public static class HomeSystemEndpoints
         {
             var hs = await db.HomeSystems.FirstOrDefaultAsync(h => h.Id == homeSystemId, ct);
             if (hs is null) return Results.NotFound();
-            hs.lowPrice = request.LowPrice;
-            hs.highPrice = request.HighPrice;
+            hs.LowPrice = request.LowPrice;
+            hs.HighPrice = request.HighPrice;
             await db.SaveChangesAsync(ct);
             return Results.Ok();
         });
@@ -44,7 +44,7 @@ public static class HomeSystemEndpoints
         {
             var homeSystem = await db.HomeSystems
                 .Where(h => h.Id == homeSystemId)
-                .Select(h => new { h.Id, h.Name, h.GridNodeId, h.lowPrice, h.highPrice })
+                .Select(h => new { h.Id, h.Name, h.GridNodeId, h.LowPrice, h.HighPrice })
                 .FirstOrDefaultAsync(ct);
             if (homeSystem is null) return Results.NotFound();
 
@@ -60,9 +60,9 @@ public static class HomeSystemEndpoints
                 Type = d.GetType().Name,
                 CurrentChargeKWH = (d as Accumulator)?.CurrentChargeKWH,
                 CapacityKWH = (d as Accumulator)?.CapacityKWH,
-                LowKWH = (d as Accumulator)?.lowKWH,
-                MaxKWH = (d as Accumulator)?.maxKWH,
-                MinKWH = (d as Accumulator)?.minKWH,
+                LowKWH = (d as Accumulator)?.LowKWH,
+                MaxKWH = (d as Accumulator)?.MaxKWH,
+                MinKWH = (d as Accumulator)?.MinKWH,
                 Priority = (d as Accumulator)?.Priority,
                 Mode = (d as Accumulator)?.Mode.ToString(),
                 Simulations = d.Simulations.Select(s => new
@@ -83,8 +83,8 @@ public static class HomeSystemEndpoints
         // live meter reads — HomeSysLogic is the single place that decides what's
         // happening, and everything else (this endpoint included) just reflects its
         // output: NetGridKw/Scenario come straight from its last tick via the status
-        // tracker; InverterMode/InverterCurrent/Mode/CurrentChargeKWH/appliedCurrentKw
-        // come straight from the DB rows it wrote (Mode and appliedCurrentKw both derive
+        // tracker; InverterMode/InverterCurrent/Mode/CurrentChargeKWH/AppliedCurrentKw
+        // come straight from the DB rows it wrote (Mode and AppliedCurrentKw both derive
         // from/are set by the same tick). No independent recomputation, so the UI can't
         // show numbers that contradict the scenario that produced them.
         app.MapGet("/home-systems/{homeSystemId:int}/status", async (int homeSystemId, VppDbContext db, HomeSysStatusTracker statusTracker, CancellationToken ct) =>
@@ -112,7 +112,7 @@ public static class HomeSystemEndpoints
                     acc.CurrentChargeKWH,
                     acc.CapacityKWH,
                     SocPercent = acc.CapacityKWH > 0 ? acc.CurrentChargeKWH / acc.CapacityKWH * 100 : 0,
-                    CurrentKw = acc.appliedCurrentKw   // the actual ramp-tracked rate, signed (+discharge/-charge)
+                    CurrentKw = acc.AppliedCurrentKw   // the actual ramp-tracked rate, signed (+discharge/-charge)
                 })
                 .ToList();
 
@@ -130,7 +130,18 @@ public static class HomeSystemEndpoints
                 NetGridKw = snapshot?.NetGridKw ?? 0,
                 GeneratedKw = snapshot?.GeneratedKw ?? 0,
                 AcConsumption = snapshot?.AcConsumption ?? 0,
-                GeneratedAcKw = (snapshot?.GeneratedKw ?? 0) * inverter.dc2acEfficiency,
+                // Curtailed counterparts of the two above — clamped to the inverter's
+                // MaxDCInput/MaxOutputPower, still in their native DC/AC domains, for
+                // plotting directly against the raw per-device curves on the main chart.
+                DeliverableGeneratedKw = snapshot?.DeliverableGeneratedKw ?? 0,
+                DeliverableAcConsumption = snapshot?.DeliverableAcConsumption ?? 0,
+                // DeliverableGeneratedKw converted to AC — a third, separate quantity.
+                ActualGenerationKw = snapshot?.ActualGenerationKw ?? 0,
+                // True when the raw measured value above exceeds what the inverter can
+                // actually pass through — HomeSysLogic already clamps its own dispatch
+                // math for this, these just let the UI warn that it's happening.
+                Overloaded = snapshot?.Overloaded ?? false,
+                Overgenerating = snapshot?.Overgenerating ?? false,
                 ActiveAccPriority = homeSystem.ActiveAccPriority,
                 Accumulators = accumulators
             });

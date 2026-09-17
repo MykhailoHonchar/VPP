@@ -3,12 +3,11 @@ import { useParams, Link } from "react-router-dom"
 
 import { Chart } from 'chart.js/auto'
 import zoomPlugin from 'chartjs-plugin-zoom'
+import { COLORS } from './colors'
 
 Chart.register(zoomPlugin)
 
 const LIVE_HISTORY_MS = 5 * 24 * 3600 * 1000
-
-const COLORS = ['#16a34a', '#2563eb', '#f59e0b', '#8b5cf6', '#eb4497']
 
 // Mirrors the backend's DispatchStatus enum (HomeSysLogic.cs) — one color per reason the
 // inverter is doing what it's doing right now, used to color the price line by segment.
@@ -56,11 +55,13 @@ interface HomeSystemStatus {
   netGridKw: number
   generatedKw: number
   acConsumption: number
-  generatedAcKw: number
+  actualGenerationKw: number
   activeAccPriority: number
   accumulators: AccumulatorStatus[]
   scenario: string
   status: string
+  overloaded: boolean
+  overgenerating: boolean
 }
 
 function HomeSystemPage()
@@ -126,13 +127,15 @@ function HomeSystemPage()
   const [netGridKw, setNetGridKw] = useState(0)
   const [generatedKw, setGeneratedKw] = useState(0)
   const [acConsumption, setAcConsumption] = useState(0)
-  const [generatedAcKw, setGeneratedAcKw] = useState(0)
+  const [actualGenerationKw, setActualGenerationKw] = useState(0)
   const [inverterCurrent, setInverterCurrent] = useState(0)
   // "Active" battery: the one HomeSysLogic actually put into Charging/Draining this
   // tick, inferred from Mode — the most reliable externally-observable signal of which
   // accumulator the backend is currently using.
   const [activeAccumulator, setActiveAccumulator] = useState<AccumulatorStatus | null>(null)
   const [scenario, setScenario] = useState('')
+  const [overloaded, setOverloaded] = useState(false)
+  const [overgenerating, setOvergenerating] = useState(false)
   const [allAccumulators, setAllAccumulators] = useState<AccumulatorStatus[]>([])
   const [activeAccPriority, setActiveAccPriority] = useState(0)
 
@@ -472,12 +475,14 @@ function HomeSystemPage()
       setNetGridKw(status.netGridKw)
       setGeneratedKw(status.generatedKw)
       setAcConsumption(status.acConsumption)
-      setGeneratedAcKw(status.generatedAcKw)
+      setActualGenerationKw(status.actualGenerationKw)
       setAllAccumulators(status.accumulators)
       setActiveAccPriority(status.activeAccPriority)
       setInverterCurrent(status.inverterCurrent)
       setActiveAccumulator(status.accumulators.find((a) => a.mode === 'Charging' || a.mode === 'Draining') ?? null)
       setScenario(status.scenario)
+      setOverloaded(status.overloaded)
+      setOvergenerating(status.overgenerating)
 
       gridPowerDataRef.current.push({ x: now, y: status.inverterCurrent })
       while (gridPowerDataRef.current.length && gridPowerDataRef.current[0].x < cutoff) gridPowerDataRef.current.shift()
@@ -637,9 +642,15 @@ function HomeSystemPage()
           </div>
 
           <h3>Live State</h3>
+          {(overloaded || overgenerating) && (
+            <p style={{ color: '#ef4444', fontWeight: 600 }}>
+              {overloaded && 'Overload: AC demand exceeds the inverter\'s rated output — excess is being curtailed. '}
+              {overgenerating && 'Overgeneration: DC input exceeds the inverter\'s max — excess is being curtailed.'}
+            </p>
+          )}
           <p>Scenario: <strong>{scenario || '—'}</strong></p>
           <p>Net grid power: {netGridKw.toFixed(2)} kW ({inverterMode || '—'})</p>
-          <p>generatedKw: {generatedKw.toFixed(2)} kW | generatedKw*dc2acEfficiency: {generatedAcKw.toFixed(2)} kW | acConsumption: {acConsumption.toFixed(2)} kW</p>
+          <p>Pure Gen: {generatedKw.toFixed(2)} kW | actualGeneration: {actualGenerationKw.toFixed(2)} kW | Consumption: {acConsumption.toFixed(2)} kW</p>
           <p>Inverter: {inverterMode || '—'}, {inverterCurrent.toFixed(2)} kW</p>
           <p>
             Active battery (priority {activeAccPriority}):{' '}

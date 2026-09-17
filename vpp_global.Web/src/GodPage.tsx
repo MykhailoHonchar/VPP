@@ -133,6 +133,9 @@ function GodPage() {
     setPriceSavedAt(Date.now())
   }
 
+  const updateAccField = (deviceId: number, field: keyof AccForm, value: string) =>
+    setAccForms((m) => ({ ...m, [deviceId]: { ...m[deviceId], [field]: value } }))
+
   async function saveAccumulator(deviceId: number) {
     const f = accForms[deviceId]
     if (!f) return
@@ -179,12 +182,12 @@ function GodPage() {
 
           {d.currentChargeKWH !== null && accForms[d.id] && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <label>Current charge kWh <input type="number" step="1" value={accForms[d.id].currentChargeKWH} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], currentChargeKWH: e.target.value } }))} style={{ width: '80px' }} /></label>
-              <label>Capacity kWh <input type="number" step="1" value={accForms[d.id].capacityKWH} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], capacityKWH: e.target.value } }))} style={{ width: '80px' }} /></label>
-              <label>Low kWh <input type="number" step="1" value={accForms[d.id].lowKWH} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], lowKWH: e.target.value } }))} style={{ width: '80px' }} /></label>
-              <label>Max kWh <input type="number" step="1" value={accForms[d.id].maxKWH} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], maxKWH: e.target.value } }))} style={{ width: '80px' }} /></label>
-              <label>Min kWh <input type="number" step="1" value={accForms[d.id].minKWH} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], minKWH: e.target.value } }))} style={{ width: '80px' }} /></label>
-              <label>Priority <input type="number" step="1" value={accForms[d.id].priority} onChange={(e) => setAccForms((m) => ({ ...m, [d.id]: { ...m[d.id], priority: e.target.value } }))} style={{ width: '60px' }} /></label>
+              <label>Current charge kWh <input type="number" step="1" value={accForms[d.id].currentChargeKWH} onChange={(e) => updateAccField(d.id, 'currentChargeKWH', e.target.value)} style={{ width: '80px' }} /></label>
+              <label>Capacity kWh <input type="number" step="1" value={accForms[d.id].capacityKWH} onChange={(e) => updateAccField(d.id, 'capacityKWH', e.target.value)} style={{ width: '80px' }} /></label>
+              <label>Low kWh <input type="number" step="1" value={accForms[d.id].lowKWH} onChange={(e) => updateAccField(d.id, 'lowKWH', e.target.value)} style={{ width: '80px' }} /></label>
+              <label>Max kWh <input type="number" step="1" value={accForms[d.id].maxKWH} onChange={(e) => updateAccField(d.id, 'maxKWH', e.target.value)} style={{ width: '80px' }} /></label>
+              <label>Min kWh <input type="number" step="1" value={accForms[d.id].minKWH} onChange={(e) => updateAccField(d.id, 'minKWH', e.target.value)} style={{ width: '80px' }} /></label>
+              <label>Priority <input type="number" step="1" value={accForms[d.id].priority} onChange={(e) => updateAccField(d.id, 'priority', e.target.value)} style={{ width: '60px' }} /></label>
               <span style={{ fontSize: '0.85em', opacity: 0.8 }}>Mode: {d.mode}</span>
               <button onClick={() => saveAccumulator(d.id)}>Save</button>
               {accSavedAt[d.id] && <span style={{ fontSize: '0.8em', opacity: 0.7 }}>Saved</span>}
