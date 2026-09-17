@@ -8,6 +8,10 @@ public abstract class DeviceModel
 public class InverterModel : DeviceModel
 {
     public required double RatedPowerKw { get; set; }       // max continuous AC output
+    // Unused for now — Inverter.MaxDCInput (the instance-level field) is the one HomeSysLogic
+    // and /devices/{id}/live actually clamp against, since the two had drifted to different
+    // values in practice. Left here rather than deleted in case a real per-model spec (as
+    // opposed to a per-instance override) is wanted later.
     public required double MaxDcInputKw { get; set; }        // max DC power it can accept from panels/battery (usually somewhat higher than RatedPowerKw)
     public required double EfficiencyPercent { get; set; }   // DC-to-AC conversion efficiency, typically 95-98 for modern inverters
     public required bool IsHybrid { get; set; }               // can it manage battery charge/discharge directly, vs. a grid-tie solar-only inverter
