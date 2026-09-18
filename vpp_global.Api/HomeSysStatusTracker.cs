@@ -4,7 +4,7 @@ using System.Collections.Concurrent;
 // source of truth for what the UI shows. Nothing downstream (the status endpoint)
 // re-derives these numbers independently; it only reads what HomeSysLogic actually
 // decided. Registered as a singleton, written by PowerReadingIngestionService each tick.
-public record HomeSysSnapshot(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, bool Overloaded, bool Overgenerating, DateTime At);
+public record HomeSysSnapshot(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, double? PredictedBatteryKw, bool Overloaded, bool Overgenerating, DateTime At);
 
 public class HomeSysStatusTracker
 {

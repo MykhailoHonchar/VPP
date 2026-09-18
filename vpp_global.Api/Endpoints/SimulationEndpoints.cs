@@ -16,6 +16,15 @@ public static class SimulationEndpoints
             return Results.Ok(new { clock.HoursPerTick });
         });
 
+        app.MapGet("/simulation/recording", (RecordingSettings recording) =>
+            Results.Ok(new { recording.RecordPowerReadings }));
+
+        app.MapPost("/simulation/recording", (SetRecordingRequest request, RecordingSettings recording) =>
+        {
+            recording.RecordPowerReadings = request.RecordPowerReadings;
+            return Results.Ok(new { recording.RecordPowerReadings });
+        });
+
         // One row = one sine/noise curve component, whether it belongs to a device
         // (solar/consumer/...) or a grid node (price) — same table, same shape, so one
         // endpoint edits both. Picked up on the very next tick: SimulatedPowerMeterReader/
@@ -37,4 +46,5 @@ public static class SimulationEndpoints
 }
 
 public record SetSimulationSpeedRequest(double HoursPerTick);
+public record SetRecordingRequest(bool RecordPowerReadings);
 public record UpdateSimulationRequest(double MeanKw, double AmplitudeKw, double PeriodHours, double PhaseShift, double NoiseStdDevKw, bool AllowNegative);

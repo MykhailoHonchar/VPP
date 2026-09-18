@@ -20,14 +20,20 @@ public class HomeSysLogic
     // domains respectively, for comparing directly against the raw per-device curves.
     // ActualGenerationKw is DeliverableGeneratedKw converted to AC (DeliverableGeneratedKw
     // * dc2acEfficiency) — a third, separate quantity, not a duplicate of either.
-    public record HomeSysPowerRes(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, bool Overloaded, bool Overgenerating);
+    // PredictedBatteryKw is the forecast net battery power — consumption's predicted
+    // magnitude minus generation's, so positive means predicted discharge and negative
+    // predicted charge, matching Accumulator's own sign convention. Null whenever a
+    // Generator or Consumer on this HomeSystem hasn't been analyzed yet (no PowerSpectrum
+    // to predict from).
+    public record HomeSysPowerRes(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, double? PredictedBatteryKw, bool Overloaded, bool Overgenerating);
     private readonly VppDbContext db;
     private readonly IPowerMeterReader meter;
     private readonly IGridPriceProvider pricer;
+    private readonly RecordingSettings recording;
     private readonly HomeSystem homeSystem;
     private readonly Inverter inverter;
 
-    public static async Task<HomeSysLogic> CreateAsync(int homeSystemId, VppDbContext _db, IPowerMeterReader _meter, IGridPriceProvider _pricer, CancellationToken ct = default)
+    public static async Task<HomeSysLogic> CreateAsync(int homeSystemId, VppDbContext _db, IPowerMeterReader _meter, IGridPriceProvider _pricer, RecordingSettings _recording, CancellationToken ct = default)
     {
         var homeSystem = await _db.HomeSystems
             .Include(hs => hs.Generators)
@@ -41,39 +47,57 @@ public class HomeSysLogic
             .Include(i => i.InverterModel)
             .FirstAsync(i => i.HomeSystemId == homeSystemId, ct);
 
-        return new HomeSysLogic(_db, _meter, _pricer, homeSystem, inverter);
+        return new HomeSysLogic(_db, _meter, _pricer, _recording, homeSystem, inverter);
     }
 
-    private HomeSysLogic(VppDbContext _db, IPowerMeterReader _meter, IGridPriceProvider _pricer, HomeSystem _homeSystem, Inverter _inverter)
+    private HomeSysLogic(VppDbContext _db, IPowerMeterReader _meter, IGridPriceProvider _pricer, RecordingSettings _recording, HomeSystem _homeSystem, Inverter _inverter)
     {
         db = _db;
         meter = _meter;
         pricer = _pricer;
+        recording = _recording;
         homeSystem = _homeSystem;
         inverter = _inverter;
     }
-    public async Task<HomeSysPowerRes> ReadHomeSysPowerAsync(DateTime at, double hoursPerTick)
+    public async Task<HomeSysPowerRes> ReadHomeSysPowerAsync(DateTime at, double hoursPerTick, CancellationToken ct = default)
     {
         double generatedKw = 0;
         double acConsumption = 0;
-        List<PowerReading> readings = new List<PowerReading>();
 
-        // Uses the caller-provided `at` (the simulated clock), not DateTime.UtcNow —
-        // this used to be shadowed by a locally-declared `now`, which meant Generator/
-        // Consumer curves and price were always sampled at real wall-clock time no
-        // matter how fast the simulation was sped up.
-        async Task ReadDeviceAsync(int deviceId, bool isDcContributor, bool isAcConsumer)
+        async Task ReadDeviceAsync(Device device, bool isDcContributor, bool isAcConsumer)
         {
-            var val = await meter.ReadPowerKwAt(deviceId, at);
-            PowerReading reading = new PowerReading{ DeviceId = deviceId, Timestamp = at, PowerKw = val };
-            readings.Add(reading);
-            db.Add(reading);
+            var val = await meter.ReadPowerKwAt(device.Id, at);
+            if (recording.RecordPowerReadings)
+                db.Add(new PowerReading { DeviceId = device.Id, Timestamp = at, PowerKw = DeviceCurtailment.Apply(device, inverter, val) });
             if (isDcContributor) generatedKw += val;
             if(isAcConsumer) acConsumption += -val;   // val is negative for Consumer; store demand as a positive kW magnitude
         }
 
-        foreach (var g in homeSystem.Generators) await ReadDeviceAsync(g.Id, isDcContributor: true, isAcConsumer: false);
-        foreach (var c in homeSystem.Consumers) await ReadDeviceAsync(c.Id, isDcContributor: false, isAcConsumer: true);
+        foreach (var g in homeSystem.Generators) await ReadDeviceAsync(g, isDcContributor: true, isAcConsumer: false);
+        foreach (var c in homeSystem.Consumers) await ReadDeviceAsync(c, isDcContributor: false, isAcConsumer: true);
+
+        // Predicted net battery power, computed here (not just derived client-side) so any
+        // future dispatch logic can use it directly. Sums every Generator's and every
+        // Consumer's predicted curve (matching how generatedKw/acConsumption themselves
+        // aggregate across multiple devices), then inverts generation-plus-consumption
+        // (consumption's own predicted value is already negative) so positive = predicted
+        // discharge, negative = predicted charge — the same convention AppliedCurrentKw
+        // uses. Null unless every Generator and Consumer on this HomeSystem has a
+        // PowerSpectrum to predict from (i.e. /analyze has actually been run on all of them).
+        double? predictedBatteryKw = null;
+        var predictableDeviceIds = homeSystem.Generators.Select(g => g.Id)
+            .Concat(homeSystem.Consumers.Select(c => c.Id))
+            .ToList();
+        if (predictableDeviceIds.Count > 0)
+        {
+            var spectra = await db.Set<PowerSpectrum>()
+                .Include(s => s.Components)
+                .Include(s => s.Device)
+                .Where(s => s.DeviceId != null && predictableDeviceIds.Contains(s.DeviceId.Value))
+                .ToListAsync(ct);
+            if (spectra.Count == predictableDeviceIds.Count)
+                predictedBatteryKw = -spectra.Sum(s => PowerPredictor.Predict(s, at));
+        }
 
         bool overloaded = acConsumption > inverter.MaxOutputPower;
         bool overgenerating = generatedKw > inverter.MaxDCInput;
@@ -247,8 +271,8 @@ public class HomeSysLogic
             acc.LastTickAt = at;
             acc.Mode = Accumulator.ComputeMode(acc);
 
-            await ReadDeviceAsync(acc.Id, isDcContributor: false, isAcConsumer: false);
+            await ReadDeviceAsync(acc, isDcContributor: false, isAcConsumer: false);
         }
-        return new HomeSysPowerRes(scenario, status, netGridKw, generatedKw, acConsumption, deliverableGeneratedKw, deliverableAcConsumption, deliverableGeneratedKw * inverter.dc2acEfficiency, overloaded, overgenerating);
+        return new HomeSysPowerRes(scenario, status, netGridKw, generatedKw, acConsumption, deliverableGeneratedKw, deliverableAcConsumption, deliverableGeneratedKw * inverter.dc2acEfficiency, predictedBatteryKw, overloaded, overgenerating);
     }
 }

@@ -15,6 +15,7 @@ builder.Services.AddScoped<IGridPriceProvider, SimulatedGrid>();
 builder.Services.AddScoped<IPowerSpectrumAnalyzer, PowerSpectrumAnalyzer>();
 builder.Services.AddSingleton<SimulationClock>();
 builder.Services.AddSingleton<HomeSysStatusTracker>();
+builder.Services.AddSingleton<RecordingSettings>();
 builder.Services.AddHostedService<PowerReadingIngestionService>();
 
 var app = builder.Build();

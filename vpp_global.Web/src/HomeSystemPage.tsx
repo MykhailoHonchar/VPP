@@ -37,6 +37,14 @@ interface DeviceInfo  {
     type: string
 }
 
+// Spectral prediction only makes sense for devices that follow a repeating natural
+// curve — Generators and Consumers. Batteries/EVs follow dispatch decisions (not a
+// predictable periodic signal), and the Inverter has no PowerReadings of its own at
+// all, so both would just waste an /analyze call and clutter the chart with a
+// meaningless "(predicted)" line.
+const PREDICTABLE_TYPES = new Set(['SolarPowerPlant', 'WindPowerPlant', 'Consumer'])
+const isPredictable = (type: string) => PREDICTABLE_TYPES.has(type)
+
 interface AccumulatorStatus {
   deviceId: number
   name: string
@@ -56,6 +64,7 @@ interface HomeSystemStatus {
   generatedKw: number
   acConsumption: number
   actualGenerationKw: number
+  predictedBatteryKw: number | null
   activeAccPriority: number
   accumulators: AccumulatorStatus[]
   scenario: string
@@ -71,6 +80,15 @@ function HomeSystemPage()
   // that immediately re-renders with value=0 wipes out the "." you just typed.
   const [simHoursPerTickText, setSimHoursPerTickText] = useState('1')
   const simHoursPerTick = Number(simHoursPerTickText) || 0
+
+  // Off by default — see RecordingSettings.cs. Turning it on means every tick from now
+  // on writes real PowerReading rows for /analyze to later read; leaving it off (the
+  // default) means casual speed-changing/testing doesn't keep polluting that history.
+  const [recordPowerReadings, setRecordPowerReadings] = useState(false)
+
+  const [backfillDaysText, setBackfillDaysText] = useState('30')
+  const backfillDays = Number(backfillDaysText) || 0
+  const [backfilling, setBackfilling] = useState(false)
 
   // Single shared simulated clock, driven by real elapsed time rather than incremented
   // per JS interval tick — this is what lets every chart (power/price, which evaluate a
@@ -96,7 +114,15 @@ function HomeSystemPage()
   const totalDataRef = useRef<{ x: number; y: number }[]>([])
   const predictedDataByDevice = useRef<Map<number, { x: number; y: number }[]>>(new Map())
   const totalPredictedRef = useRef<{ x: number; y: number }[]>([])
+  // Sourced from status.predictedBatteryKw (computed backend-side, in HomeSysLogic) —
+  // one aggregate line, not per-battery; see PredictedBatteryKw's own comment for the
+  // sign convention and formula.
+  const batteryPredictedDataRef = useRef<{ x: number; y: number }[]>([])
+  // Whether /predict actually gets fetched each tick — a ref (not just the mirrored
+  // predictShown state below) because tick()'s closure reads it without re-running the
+  // effect on every toggle.
   const predictEnabledRef = useRef(false)
+  const [predictShown, setPredictShown] = useState(false)
   const [log, setLog] = useState('')
   const addLog = (msg: string) => setLog((prev) => prev + msg + '\n')
 
@@ -155,7 +181,7 @@ function HomeSystemPage()
       .then((res) => (res.ok ? res.json() : []))
       .then((list: DeviceInfo[]) => {
         setDevices(list)
-        const initial: Record<string, boolean> = { total: true }
+        const initial: Record<string, boolean> = { total: true, batteryPredicted: true }
         for (const d of list) initial[d.id] = true
         setVisible(initial)
       })
@@ -166,6 +192,24 @@ function HomeSystemPage()
       .then((res) => (res.ok ? res.json() : null))
       .then((hs) => { if (hs) setGridNodeId(hs.gridNodeId) })
   }, [homeSystemId])
+
+  // RecordingSettings is a backend-wide singleton (not per-home-system), so this
+  // reflects whatever any client last set it to — fetched once on mount rather than
+  // assumed, in case it was already turned on from another tab/session.
+  useEffect(() => {
+    fetch('/simulation/recording')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (data) setRecordPowerReadings(data.recordPowerReadings) })
+  }, [])
+
+  function handleToggleRecording(checked: boolean) {
+    setRecordPowerReadings(checked)
+    fetch('/simulation/recording', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ recordPowerReadings: checked }),
+    })
+  }
 
   // The same "Sim hours/tick" control also drives the real backend simulation speed
   // (HomeSysLogic applies this many simulated hours per real tick), so the SoC and
@@ -191,6 +235,7 @@ function HomeSystemPage()
     totalDataRef.current = []
     predictedDataByDevice.current.clear()
     totalPredictedRef.current = []
+    batteryPredictedDataRef.current = []
     predictEnabledRef.current = false
     simClockRef.current = { simMs: Date.now(), realMs: Date.now(), hoursPerRealSecond: simHoursPerTick }
     simTimeRef.current = new Date(currentSimTimeMs())
@@ -277,7 +322,9 @@ function HomeSystemPage()
               : { timestamp: new Date().toISOString(), powerKw: 0 }
             // Predict is asked about the exact instant live just reported (not a
             // separately-guessed one), so the two curves stay directly comparable.
-            const predicted = predictEnabledRef.current
+            // Only Generator/Consumer devices ever get analyzed, so only fetch a
+            // prediction for those — a Battery/Inverter id would just 404.
+            const predicted = predictEnabledRef.current && isPredictable(d.type)
               ? await fetch(`/devices/${d.id}/predict?from=${timestamp}&to=${timestamp}`)
                   .then((r) => (r.ok ? r.json() : null))
                   .then((arr) => arr?.[0] ?? null)
@@ -332,15 +379,19 @@ function HomeSystemPage()
             pointRadius: 0,
             hidden: !visible[d.id],
           })),
-          ...devices.map((d, i) => ({
-            label: `${d.name} (predicted)`,
-            data: predictedDataByDevice.current.get(d.id) ?? [],
-            borderColor: COLORS[i % COLORS.length],
-            borderDash: [4, 4],
-            borderWidth: 1,
-            pointRadius: 0,
-            hidden: !visible[d.id],
-          })),
+          ...devices
+            .filter((d) => isPredictable(d.type))
+            .map((d) => ({
+              label: `${d.name} (predicted)`,
+              data: predictedDataByDevice.current.get(d.id) ?? [],
+              // Same color as this device's actual line, found by its position in the
+              // full (unfiltered) device list, so the two stay visually paired.
+              borderColor: COLORS[devices.findIndex((dd) => dd.id === d.id) % COLORS.length],
+              borderDash: [4, 4],
+              borderWidth: 1,
+              pointRadius: 0,
+              hidden: !visible[d.id],
+            })),
           {
             label: 'Total',
             data: totalDataRef.current,
@@ -357,6 +408,18 @@ function HomeSystemPage()
             borderWidth: 2,
             pointRadius: 0,
             hidden: !visible['total'],
+          },
+          {
+            // Generation prediction + consumption prediction (already negative) — the
+            // predicted net surplus/deficit the batteries would need to absorb/supply.
+            // One aggregate line (not per-battery), same reasoning as "Total".
+            label: 'Battery (predicted)',
+            data: batteryPredictedDataRef.current,
+            borderColor: '#a855f7',
+            borderDash: [4, 4],
+            borderWidth: 2,
+            pointRadius: 0,
+            hidden: !visible['batteryPredicted'],
           },
         ]
         chartRef.current.options.scales!.x!.min = simTimeRef.current.getTime() - LIVE_HISTORY_MS
@@ -487,6 +550,13 @@ function HomeSystemPage()
       gridPowerDataRef.current.push({ x: now, y: status.inverterCurrent })
       while (gridPowerDataRef.current.length && gridPowerDataRef.current[0].x < cutoff) gridPowerDataRef.current.shift()
 
+      // Computed backend-side now (HomeSysLogic) — null until every Generator/Consumer
+      // has been analyzed at least once.
+      if (status.predictedBatteryKw !== null) {
+        batteryPredictedDataRef.current.push({ x: now, y: status.predictedBatteryKw })
+        while (batteryPredictedDataRef.current.length && batteryPredictedDataRef.current[0].x < cutoff) batteryPredictedDataRef.current.shift()
+      }
+
       let namesChanged = false
       const nextNames = { ...accNames }
       for (const acc of status.accumulators) {
@@ -555,14 +625,46 @@ function HomeSystemPage()
   }, [homeSystemId, socVisible, stateVisible, accNames])
 
 
+  // Keeps the ref tick() actually reads in sync with the checkbox shown in the UI —
+  // used both by that checkbox directly and by handleAnalyze/handleBackfillAndAnalyze,
+  // which turn prediction on as a side effect of computing something to predict from.
+  function setPredictionShown(shown: boolean) {
+    predictEnabledRef.current = shown
+    setPredictShown(shown)
+  }
+
   async function handleAnalyze() {
-    for (const d of devices) {
-      addLog(`Analyzing device ${d.id}...`)
+    for (const d of devices.filter((d) => isPredictable(d.type))) {
+      addLog(`Analyzing device ${d.id} (${d.name})...`)
       const res = await fetch(`/devices/${d.id}/analyze`, { method: 'POST' })
       if (!res.ok) { addLog(`Analyze failed for device ${d.id}: ${res.status} ${await res.text()}`); continue }
     }
-    predictEnabledRef.current = true
+    setPredictionShown(true)
     addLog('Prediction enabled — now plotting alongside live data.')
+  }
+
+  // Generates a clean, perfectly-evenly-spaced (hourly) history via /readings/generate
+  // instead of relying on live-recorded ticks — even with Fourier.cs's hoursPerSample
+  // fix, live ticks are still spaced irregularly (real tick jitter, sim-speed changes),
+  // where a backfill gives the FFT an ideal uniform grid to work with.
+  async function handleBackfillAndAnalyze() {
+    setBackfilling(true)
+    for (const d of devices.filter((d) => isPredictable(d.type))) {
+      addLog(`Backfilling ${backfillDays} days for device ${d.id} (${d.name})...`)
+      const genRes = await fetch(`/devices/${d.id}/readings/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ days: backfillDays }),
+      })
+      if (!genRes.ok) { addLog(`Backfill failed for device ${d.id}: ${genRes.status} ${await genRes.text()}`); continue }
+
+      addLog(`Analyzing device ${d.id} (${d.name})...`)
+      const analyzeRes = await fetch(`/devices/${d.id}/analyze`, { method: 'POST' })
+      if (!analyzeRes.ok) { addLog(`Analyze failed for device ${d.id}: ${analyzeRes.status} ${await analyzeRes.text()}`); continue }
+    }
+    setPredictionShown(true)
+    setBackfilling(false)
+    addLog('Backfill + analysis complete — prediction enabled.')
   }
 
   return (
@@ -571,7 +673,34 @@ function HomeSystemPage()
         Sim hours/tick{' '}
         <input type="number" step="0.01" value={simHoursPerTickText} onChange={(e) => setSimHoursPerTickText(e.target.value)} />
       </label>
+      {' '}
+      <label title="Off by default — casual speed-changing/testing won't pollute PowerReading history used by Analyze.">
+        <input
+          type="checkbox"
+          checked={recordPowerReadings}
+          onChange={(e) => handleToggleRecording(e.target.checked)}
+        />
+        {' '}Record power readings
+      </label>
       <button onClick={handleAnalyze}>Analyze (Live)</button>
+      {' '}
+      <label>
+        Backfill days{' '}
+        <input type="number" step="1" min="1" value={backfillDaysText} onChange={(e) => setBackfillDaysText(e.target.value)} style={{ width: '60px' }} />
+      </label>
+      {' '}
+      <button onClick={handleBackfillAndAnalyze} disabled={backfilling}>
+        {backfilling ? 'Backfilling…' : 'Backfill & Analyze'}
+      </button>
+      {' '}
+      <label title="Shows generation/consumption predictions (and the derived battery/total predicted lines) without re-running analysis. Only has something to show once a spectrum exists — via Analyze (Live) or Backfill & Analyze.">
+        <input
+          type="checkbox"
+          checked={predictShown}
+          onChange={(e) => setPredictionShown(e.target.checked)}
+        />
+        {' '}Show predictions
+      </label>
       {' '}<Link to={`/homesystem/${homeSystemId}/god`}>God mode</Link>
       <h2>Home System {homeSystemId}</h2>
 
@@ -602,6 +731,14 @@ function HomeSystemPage()
                 onChange={(e) => setVisible((v) => ({ ...v, total: e.target.checked }))}
               />
               {' '}Total
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={visible['batteryPredicted'] ?? true}
+                onChange={(e) => setVisible((v) => ({ ...v, batteryPredicted: e.target.checked }))}
+              />
+              {' '}Battery (predicted)
             </label>
           </div>
           <div style={{ height: '500px' }}>

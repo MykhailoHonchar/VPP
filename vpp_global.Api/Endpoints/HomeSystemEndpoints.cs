@@ -137,6 +137,10 @@ public static class HomeSystemEndpoints
                 DeliverableAcConsumption = snapshot?.DeliverableAcConsumption ?? 0,
                 // DeliverableGeneratedKw converted to AC — a third, separate quantity.
                 ActualGenerationKw = snapshot?.ActualGenerationKw ?? 0,
+                // Predicted net battery power (positive=predicted discharge, negative=
+                // predicted charge, matching AppliedCurrentKw's own convention) — null
+                // until every Generator/Consumer here has been analyzed at least once.
+                PredictedBatteryKw = snapshot?.PredictedBatteryKw,
                 // True when the raw measured value above exceeds what the inverter can
                 // actually pass through — HomeSysLogic already clamps its own dispatch
                 // math for this, these just let the UI warn that it's happening.

@@ -120,10 +120,18 @@ public class PowerSpectrumAnalyzer : IPowerSpectrumAnalyzer
 
     private static (double[] samples, double hoursPerSample) Resample(List<PowerReading> readings, DateTime t0)
     {
-        // TODO: real gap-filling onto a uniform grid. For now, assumes readings
-        // already arrive roughly one per hour with no missing intervals.
-        const double hoursPerSample = 1.0;
+        // TODO: real gap-filling onto a uniform grid — this still assumes readings are
+        // roughly evenly spaced, just no longer that the spacing is exactly one hour.
+        // Readings are recorded once per ingestion tick, at whatever simulated-time gap
+        // that tick happened to advance by (SimulationClock's rate × real tick period,
+        // itself jittery) — treating that as a hardcoded 1.0 made every recovered
+        // PeriodHours wrong by roughly (true average spacing / 1.0), which is why a
+        // predicted curve could come out oscillating at a completely different rate
+        // than the real one. Deriving it from the actual first/last timestamps fixes the
+        // scale even though the grid still isn't perfectly uniform tick to tick.
         var samples = readings.Select(r => r.PowerKw).ToArray();
+        var totalHours = (readings[^1].Timestamp - readings[0].Timestamp).TotalHours;
+        var hoursPerSample = samples.Length > 1 && totalHours > 0 ? totalHours / (samples.Length - 1) : 1.0;
         return (samples, hoursPerSample);
     }
 

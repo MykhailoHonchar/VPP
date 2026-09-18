@@ -14,12 +14,18 @@ public static class DeviceEndpoints
             if (device is Accumulator)
                 return Results.BadRequest("Backfill is not supported for Accumulator devices — SOC is stateful and has no meaningful historical value outside of actually-simulated ticks.");
 
+            // Curtailed the same way /devices/{id}/live is — see DeviceCurtailment —
+            // so a backfilled, analyzed, and predicted curve describes the same clamped
+            // signal a live chart read would.
+            var inverter = await db.Set<Inverter>().FirstOrDefaultAsync(i => i.HomeSystemId == device.HomeSystemId, ct);
+
             var now = DateTime.UtcNow;
             var start = now.AddDays(-request.Days);
 
             for (var hour = start; hour <= now; hour = hour.AddHours(1))
             {
                 var kw = await meter.ReadPowerKwAt(deviceId, hour);
+                if (inverter is not null) kw = DeviceCurtailment.Apply(device, inverter, kw);
                 db.PowerReadings.Add(new PowerReading { DeviceId = deviceId, Timestamp = hour, PowerKw = kw });
             }
 
@@ -96,27 +102,17 @@ public static class DeviceEndpoints
             var timestamp = at ?? clock.Now();
             var kw = await meter.ReadPowerKwAt(deviceId, timestamp);
 
-            // Curtail Generator/Consumer readings against the home system's inverter
-            // limits right here, so the main chart's existing device line already shows
-            // the limited value directly — no separate "deliverable" line needed, and no
-            // approximation: it's the exact same reading the chart already fetched, just
-            // clamped. HomeSysLogic's own internal reads go through IPowerMeterReader
-            // directly (not this endpoint), so they stay the true, uncurtailed measurement
-            // that "Pure Gen"/"Consumption" on the Live State panel report.
-            // Only correct today because there's exactly one Generator and one Consumer
-            // per HomeSystem — with more than one of either, the inverter's limit applies
-            // to their sum, not to each independently.
+            // Curtail via the same DeviceCurtailment logic used for backfilled/recorded
+            // PowerReadings, so the main chart's device line, the analyzed history, and a
+            // live read never disagree about what's actually deliverable. HomeSysLogic's
+            // own internal aggregation stays uncurtailed regardless — that's the true
+            // measurement "Pure Gen"/"Consumption" on the Live State panel report.
             var device = await db.Set<Device>().FirstOrDefaultAsync(d => d.Id == deviceId, ct);
-            if (device is Generator or Consumer)
+            if (device is not null)
             {
                 var inverter = await db.Set<Inverter>()
                     .FirstOrDefaultAsync(i => i.HomeSystemId == device.HomeSystemId, ct);
-                if (inverter is not null)
-                {
-                    kw = device is Generator
-                        ? Math.Min(kw, inverter.MaxDCInput)
-                        : Math.Max(kw, -inverter.MaxOutputPower);   // Consumer reads negative
-                }
+                if (inverter is not null) kw = DeviceCurtailment.Apply(device, inverter, kw);
             }
 
             return Results.Ok(new { Timestamp = timestamp, PowerKw = kw });
