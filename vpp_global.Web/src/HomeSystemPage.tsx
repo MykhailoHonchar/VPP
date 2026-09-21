@@ -9,6 +9,17 @@ Chart.register(zoomPlugin)
 
 const LIVE_HISTORY_MS = 5 * 24 * 3600 * 1000
 
+// The main chart's x window is shifted forward by this much, so "now" sits this far in
+// from the right edge and the strip beyond it is forecast-only (nothing measured exists
+// there). The window keeps its LIVE_HISTORY_MS width, so this comes out of the history side.
+const FUTURE_MS = 24 * 3600 * 1000
+// Forecasts are fetched in one batch reaching 2×FUTURE_MS ahead and re-fetched once the
+// covered end is within FUTURE_REFRESH_MARGIN_MS of the visible right edge — a spectrum
+// is a fixed function of time, so the curve doesn't change as "now" advances, only the
+// window sliding over it does.
+const FUTURE_REFRESH_MARGIN_MS = 6 * 3600 * 1000
+const FUTURE_STEP_MINUTES = 15
+
 // Mirrors the backend's DispatchStatus enum (HomeSysLogic.cs) — one color per reason the
 // inverter is doing what it's doing right now, used to color the price line by segment.
 const DISPATCH_STATUS_COLORS: Record<string, string> = {
@@ -111,13 +122,23 @@ function HomeSystemPage()
   const chartCanvasRef = useRef<HTMLCanvasElement>(null)
   const chartRef = useRef<Chart | null>(null)
   const dataByDevice = useRef<Map<number, { x: number; y: number }[]>>(new Map())
-  const totalDataRef = useRef<{ x: number; y: number }[]>([])
+  // Actual grid exchange for the main chart, sourced from status.inverterCurrent
+  // (positive=selling there) and sign-flipped when pushed, so this line goes UP when
+  // we buy and DOWN when we sell. Separate from gridPowerDataRef, which keeps the
+  // inverter's own sign for the state chart.
+  const gridDataRef = useRef<{ x: number; y: number }[]>([])
   const predictedDataByDevice = useRef<Map<number, { x: number; y: number }[]>>(new Map())
-  const totalPredictedRef = useRef<{ x: number; y: number }[]>([])
   // Sourced from status.predictedBatteryKw (computed backend-side, in HomeSysLogic) —
   // one aggregate line, not per-battery; see PredictedBatteryKw's own comment for the
   // sign convention and formula.
   const batteryPredictedDataRef = useRef<{ x: number; y: number }[]>([])
+  // Forecast beyond "now" for the shifted chart window (see FUTURE_MS): per-device from
+  // /devices/{id}/predict, battery from /home-systems/{id}/predict-battery — so the
+  // battery formula stays defined once, in HomeSysLogic. futureCoveredUntilRef is the
+  // sim-time (ms) the last batch reaches; 0 forces a re-fetch on the next tick.
+  const futurePredictedByDevice = useRef<Map<number, { x: number; y: number }[]>>(new Map())
+  const futureBatteryPredictedRef = useRef<{ x: number; y: number }[]>([])
+  const futureCoveredUntilRef = useRef(0)
   // Whether /predict actually gets fetched each tick — a ref (not just the mirrored
   // predictShown state below) because tick()'s closure reads it without re-running the
   // effect on every toggle.
@@ -181,7 +202,7 @@ function HomeSystemPage()
       .then((res) => (res.ok ? res.json() : []))
       .then((list: DeviceInfo[]) => {
         setDevices(list)
-        const initial: Record<string, boolean> = { total: true, batteryPredicted: true }
+        const initial: Record<string, boolean> = { grid: true, batteryPredicted: true }
         for (const d of list) initial[d.id] = true
         setVisible(initial)
       })
@@ -232,10 +253,12 @@ function HomeSystemPage()
     if (devices.length === 0) return
     if (chartRef.current) chartRef.current.destroy()
     dataByDevice.current.clear()
-    totalDataRef.current = []
+    gridDataRef.current = []
     predictedDataByDevice.current.clear()
-    totalPredictedRef.current = []
     batteryPredictedDataRef.current = []
+    futurePredictedByDevice.current.clear()
+    futureBatteryPredictedRef.current = []
+    futureCoveredUntilRef.current = 0
     predictEnabledRef.current = false
     simClockRef.current = { simMs: Date.now(), realMs: Date.now(), hoursPerRealSecond: simHoursPerTick }
     simTimeRef.current = new Date(currentSimTimeMs())
@@ -250,15 +273,15 @@ function HomeSystemPage()
         scales: {
           x: {
             type: 'linear',
-            min: simTimeRef.current.getTime() - LIVE_HISTORY_MS,
-            max: simTimeRef.current.getTime(),
+            min: simTimeRef.current.getTime() + FUTURE_MS - LIVE_HISTORY_MS,
+            max: simTimeRef.current.getTime() + FUTURE_MS,
             ticks: { callback: (v) => new Date(v as number).toLocaleDateString() },
           },
           y: { min: -8, max: 8, title: { display: true, text: 'kW' } },
         },
         plugins: {
           // The checkboxes above already toggle each dataset's visibility — with 5
-          // devices × actual+predicted plus Total × 2, the auto-generated legend was
+          // devices × actual+predicted plus the aggregate lines, the auto-generated legend was
           // eating most of the chart's height, squeezing the actual plot into a sliver.
           legend: { display: false },
           zoom: {
@@ -306,6 +329,42 @@ function HomeSystemPage()
   useEffect(() => {
     if (devices.length === 0) return
 
+    const toPoints = (arr: { timestamp: string; predictedKw: number }[]) =>
+      arr.map((p) => ({ x: new Date(p.timestamp).getTime(), y: p.predictedKw }))
+
+    // Fetches one forecast batch from `nowMs` to 2×FUTURE_MS ahead for every predictable
+    // device plus the battery. A device/battery that isn't analyzed yet 404s and just
+    // contributes nothing (analyzing resets futureCoveredUntilRef, so this retries then).
+    const refreshFuturePredictions = async (nowMs: number) => {
+      const query = `from=${new Date(nowMs).toISOString()}&to=${new Date(nowMs + 2 * FUTURE_MS).toISOString()}&stepMinutes=${FUTURE_STEP_MINUTES}`
+      const getPoints = (url: string) =>
+        fetch(url).then((r) => (r.ok ? r.json() : null)).then((arr) => (arr ? toPoints(arr) : null))
+      const [perDevice, battery] = await Promise.all([
+        Promise.all(
+          devices
+            .filter((d) => isPredictable(d.type))
+            .map(async (d) => [d.id, await getPoints(`/devices/${d.id}/predict?${query}`)] as const)
+        ),
+        getPoints(`/home-systems/${homeSystemId}/predict-battery?${query}`),
+      ])
+      // Predictions may have been switched off while this was in flight — don't
+      // resurrect data the toggle just cleared.
+      if (!predictEnabledRef.current) return
+      for (const [deviceId, points] of perDevice) {
+        if (points) futurePredictedByDevice.current.set(deviceId, points)
+      }
+      futureBatteryPredictedRef.current = battery ?? []
+      futureCoveredUntilRef.current = nowMs + 2 * FUTURE_MS
+    }
+
+    // A predicted line's measured-era points followed by its forecast — the forecast
+    // batch starts at whatever "now" was when it was fetched, so anything at or before
+    // the last live-predicted point is dropped to keep x strictly increasing.
+    const withFuture = (past: { x: number; y: number }[], future: { x: number; y: number }[]) => {
+      const lastX = past.length ? past[past.length - 1].x : -Infinity
+      return [...past, ...future.filter((p) => p.x > lastX)]
+    }
+
     const tick = async () => {
 
       // No `at` is sent for /live — each call gets back the backend's own
@@ -337,8 +396,6 @@ function HomeSystemPage()
 
       simTimeRef.current = new Date(results[0]?.timestamp ?? currentSimTimeMs())
 
-      let total = 0
-      let totalPredicted = 0
       const nextPowers: Record<number, number> = {}
       const cutoff = simTimeRef.current.getTime() - LIVE_HISTORY_MS
       for (const r of results) {
@@ -347,21 +404,22 @@ function HomeSystemPage()
         arr.push({ x: new Date(r.timestamp).getTime(), y: r.powerKw })
         while (arr.length && arr[0].x < cutoff) arr.shift()
         dataByDevice.current.set(r.id, arr)
-        total += r.powerKw
 
         if (r.predicted) {
           const parr = predictedDataByDevice.current.get(r.id) ?? []
           parr.push({ x: new Date(r.predicted.timestamp).getTime(), y: r.predicted.predictedKw })
           while (parr.length && parr[0].x < cutoff) parr.shift()
           predictedDataByDevice.current.set(r.id, parr)
-          totalPredicted += r.predicted.predictedKw
         }
       }
       setPowers(nextPowers)
-      totalDataRef.current.push({ x: simTimeRef.current.getTime(), y: total })
-      while (totalDataRef.current.length && totalDataRef.current[0].x < cutoff) totalDataRef.current.shift()
-      totalPredictedRef.current.push({ x: simTimeRef.current.getTime(), y: totalPredicted })
-      while (totalPredictedRef.current.length && totalPredictedRef.current[0].x < cutoff) totalPredictedRef.current.shift()
+
+      if (
+        predictEnabledRef.current &&
+        futureCoveredUntilRef.current < simTimeRef.current.getTime() + FUTURE_MS + FUTURE_REFRESH_MARGIN_MS
+      ) {
+        await refreshFuturePredictions(simTimeRef.current.getTime())
+      }
 
       if (priceRes && priceRes.ok) {
         const { timestamp, powerKw: price } = await priceRes.json()
@@ -383,7 +441,7 @@ function HomeSystemPage()
             .filter((d) => isPredictable(d.type))
             .map((d) => ({
               label: `${d.name} (predicted)`,
-              data: predictedDataByDevice.current.get(d.id) ?? [],
+              data: withFuture(predictedDataByDevice.current.get(d.id) ?? [], futurePredictedByDevice.current.get(d.id) ?? []),
               // Same color as this device's actual line, found by its position in the
               // full (unfiltered) device list, so the two stay visually paired.
               borderColor: COLORS[devices.findIndex((dd) => dd.id === d.id) % COLORS.length],
@@ -393,28 +451,18 @@ function HomeSystemPage()
               hidden: !visible[d.id],
             })),
           {
-            label: 'Total',
-            data: totalDataRef.current,
+            label: 'Grid (+buying / -selling)',
+            data: gridDataRef.current,
             borderColor: '#FF0000',
             borderWidth: 2,
             pointRadius: 0,
-            hidden: !visible['total'],
+            hidden: !visible['grid'],
           },
           {
-            label: 'Total (predicted)',
-            data: totalPredictedRef.current,
-            borderColor: '#FF0000',
-            borderDash: [4, 4],
-            borderWidth: 2,
-            pointRadius: 0,
-            hidden: !visible['total'],
-          },
-          {
-            // Generation prediction + consumption prediction (already negative) — the
-            // predicted net surplus/deficit the batteries would need to absorb/supply.
-            // One aggregate line (not per-battery), same reasoning as "Total".
+            // Predicted net battery power, computed backend-side in HomeSysLogic. One
+            // aggregate line (not per-battery).
             label: 'Battery (predicted)',
-            data: batteryPredictedDataRef.current,
+            data: withFuture(batteryPredictedDataRef.current, futureBatteryPredictedRef.current),
             borderColor: '#a855f7',
             borderDash: [4, 4],
             borderWidth: 2,
@@ -422,8 +470,8 @@ function HomeSystemPage()
             hidden: !visible['batteryPredicted'],
           },
         ]
-        chartRef.current.options.scales!.x!.min = simTimeRef.current.getTime() - LIVE_HISTORY_MS
-        chartRef.current.options.scales!.x!.max = simTimeRef.current.getTime()
+        chartRef.current.options.scales!.x!.min = simTimeRef.current.getTime() + FUTURE_MS - LIVE_HISTORY_MS
+        chartRef.current.options.scales!.x!.max = simTimeRef.current.getTime() + FUTURE_MS
         chartRef.current.update()
       }
 
@@ -550,6 +598,11 @@ function HomeSystemPage()
       gridPowerDataRef.current.push({ x: now, y: status.inverterCurrent })
       while (gridPowerDataRef.current.length && gridPowerDataRef.current[0].x < cutoff) gridPowerDataRef.current.shift()
 
+      // Main-chart grid line: inverterCurrent is +selling/-buying, and this line is
+      // wanted the other way round (up = buying, down = selling), hence the negation.
+      gridDataRef.current.push({ x: now, y: -status.inverterCurrent })
+      while (gridDataRef.current.length && gridDataRef.current[0].x < cutoff) gridDataRef.current.shift()
+
       // Computed backend-side now (HomeSysLogic) — null until every Generator/Consumer
       // has been analyzed at least once.
       if (status.predictedBatteryKw !== null) {
@@ -631,6 +684,13 @@ function HomeSystemPage()
   function setPredictionShown(shown: boolean) {
     predictEnabledRef.current = shown
     setPredictShown(shown)
+    // Turning on (including via a fresh analysis, whose new spectrum invalidates any old
+    // forecast) forces the next tick to fetch the forecast; turning off drops it.
+    futureCoveredUntilRef.current = 0
+    if (!shown) {
+      futurePredictedByDevice.current.clear()
+      futureBatteryPredictedRef.current = []
+    }
   }
 
   async function handleAnalyze() {
@@ -693,7 +753,7 @@ function HomeSystemPage()
         {backfilling ? 'Backfilling…' : 'Backfill & Analyze'}
       </button>
       {' '}
-      <label title="Shows generation/consumption predictions (and the derived battery/total predicted lines) without re-running analysis. Only has something to show once a spectrum exists — via Analyze (Live) or Backfill & Analyze.">
+      <label title="Shows generation/consumption predictions (and the derived battery predicted line) without re-running analysis. Only has something to show once a spectrum exists — via Analyze (Live) or Backfill & Analyze.">
         <input
           type="checkbox"
           checked={predictShown}
@@ -727,10 +787,10 @@ function HomeSystemPage()
             <label>
               <input
                 type="checkbox"
-                checked={visible['total'] ?? true}
-                onChange={(e) => setVisible((v) => ({ ...v, total: e.target.checked }))}
+                checked={visible['grid'] ?? true}
+                onChange={(e) => setVisible((v) => ({ ...v, grid: e.target.checked }))}
               />
-              {' '}Total
+              {' '}Grid
             </label>
             <label>
               <input

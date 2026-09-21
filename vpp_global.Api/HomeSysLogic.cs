@@ -1,30 +1,10 @@
 using Microsoft.EntityFrameworkCore;
 using vpp_global.Api.Data;
 
-// A stable, colorable key for "why is the inverter doing what it's doing right now" — the
-// free-text Scenario string is for humans; this is for the UI to key a color off of without
-// string-matching. Sell/Buy each split into two reasons because they're triggered by two
-// independent OR'd conditions (battery bound vs price threshold) that the UI wants to tell
-// apart, even though today's dispatch logic only ever picks one InverterMode for both.
 public enum DispatchStatus { SellBatteryFull, SellHighPrice, SellNoBattery, BuyBatteryEmpty, BuyLowPrice, BuyNoBattery, ChargeOffgrid, DrainOffgrid }
 
 public class HomeSysLogic
 {
-    // Trimmed to the fields Ingestion.cs (the only caller) actually reads. It used to also
-    // carry HomeSysId/TimeStamp/DevRes (the caller already has `hsId`/`now`, and every
-    // PowerReading is persisted via db.Add regardless of whether it's returned here) plus
-    // totalKw (always just a copy of GeneratedKw) and CurtailedKw (always hardcoded 0).
-    // GeneratedKw/AcConsumption are the true measured ("pure") values, uncurtailed.
-    // DeliverableGeneratedKw/DeliverableAcConsumption are those same two quantities after
-    // clamping to the inverter's MaxDCInput/MaxOutputPower — still in their native DC/AC
-    // domains respectively, for comparing directly against the raw per-device curves.
-    // ActualGenerationKw is DeliverableGeneratedKw converted to AC (DeliverableGeneratedKw
-    // * dc2acEfficiency) — a third, separate quantity, not a duplicate of either.
-    // PredictedBatteryKw is the forecast net battery power — consumption's predicted
-    // magnitude minus generation's, so positive means predicted discharge and negative
-    // predicted charge, matching Accumulator's own sign convention. Null whenever a
-    // Generator or Consumer on this HomeSystem hasn't been analyzed yet (no PowerSpectrum
-    // to predict from).
     public record HomeSysPowerRes(string Scenario, DispatchStatus Status, double NetGridKw, double GeneratedKw, double AcConsumption, double DeliverableGeneratedKw, double DeliverableAcConsumption, double ActualGenerationKw, double? PredictedBatteryKw, bool Overloaded, bool Overgenerating);
     private readonly VppDbContext db;
     private readonly IPowerMeterReader meter;
@@ -59,6 +39,42 @@ public class HomeSysLogic
         homeSystem = _homeSystem;
         inverter = _inverter;
     }
+
+    public static async Task<List<PowerSpectrum>?> LoadPredictionSpectraAsync(VppDbContext db, IReadOnlyCollection<int> predictableDeviceIds, CancellationToken ct = default)
+    {
+        if (predictableDeviceIds.Count == 0) return null;
+        var spectra = await db.Set<PowerSpectrum>()
+            .Include(s => s.Components)
+            .Include(s => s.Device)
+            .Where(s => s.DeviceId != null && predictableDeviceIds.Contains(s.DeviceId.Value))
+            .ToListAsync(ct);
+        return spectra.Count == predictableDeviceIds.Count ? spectra : null;
+    }
+    public static double PredictBatteryKw(IEnumerable<PowerSpectrum> spectra, DateTime at) =>
+        -spectra.Sum(s => PowerPredictor.Predict(s, at));
+
+    // One future instant. GeneratorsKw is positive, ConsumersKw negative (the same sign as
+    // their live readings), BatteryKw is +discharge/-charge — see PredictBatteryKw.
+    public record ForecastPoint(DateTime At, double GeneratorsKw, double ConsumersKw, double BatteryKw);
+
+    const double ForecastHorizonHours = 24;
+    const double ForecastStepHours = 1;
+
+    // Points at `from` + step, + 2*step, ... up to `from` + horizon (strictly in the future;
+    // the value for `from` itself is PredictedBatteryKw). Generators/consumers are summed
+    // across every device of that kind; batteries are one aggregate, not per battery.
+    public static List<ForecastPoint> BuildForecast(IReadOnlyCollection<PowerSpectrum> spectra, IReadOnlySet<int> generatorIds, DateTime from, TimeSpan horizon, TimeSpan step)
+    {
+        var points = new List<ForecastPoint>();
+        for (var t = from + step; t <= from + horizon; t += step)
+        {
+            double generators = spectra.Where(s => s.DeviceId is int id && generatorIds.Contains(id)).Sum(s => PowerPredictor.Predict(s, t));
+            double consumers = spectra.Where(s => !(s.DeviceId is int id && generatorIds.Contains(id))).Sum(s => PowerPredictor.Predict(s, t));
+            points.Add(new ForecastPoint(t, generators, consumers, PredictBatteryKw(spectra, t)));
+        }
+        return points;
+    }
+
     public async Task<HomeSysPowerRes> ReadHomeSysPowerAsync(DateTime at, double hoursPerTick, CancellationToken ct = default)
     {
         double generatedKw = 0;
@@ -76,28 +92,20 @@ public class HomeSysLogic
         foreach (var g in homeSystem.Generators) await ReadDeviceAsync(g, isDcContributor: true, isAcConsumer: false);
         foreach (var c in homeSystem.Consumers) await ReadDeviceAsync(c, isDcContributor: false, isAcConsumer: true);
 
-        // Predicted net battery power, computed here (not just derived client-side) so any
-        // future dispatch logic can use it directly. Sums every Generator's and every
-        // Consumer's predicted curve (matching how generatedKw/acConsumption themselves
-        // aggregate across multiple devices), then inverts generation-plus-consumption
-        // (consumption's own predicted value is already negative) so positive = predicted
-        // discharge, negative = predicted charge — the same convention AppliedCurrentKw
-        // uses. Null unless every Generator and Consumer on this HomeSystem has a
-        // PowerSpectrum to predict from (i.e. /analyze has actually been run on all of them).
         double? predictedBatteryKw = null;
         var predictableDeviceIds = homeSystem.Generators.Select(g => g.Id)
             .Concat(homeSystem.Consumers.Select(c => c.Id))
             .ToList();
-        if (predictableDeviceIds.Count > 0)
-        {
-            var spectra = await db.Set<PowerSpectrum>()
-                .Include(s => s.Components)
-                .Include(s => s.Device)
-                .Where(s => s.DeviceId != null && predictableDeviceIds.Contains(s.DeviceId.Value))
-                .ToListAsync(ct);
-            if (spectra.Count == predictableDeviceIds.Count)
-                predictedBatteryKw = -spectra.Sum(s => PowerPredictor.Predict(s, at));
-        }
+        var spectra = await LoadPredictionSpectraAsync(db, predictableDeviceIds, ct);
+        if (spectra is not null)
+            predictedBatteryKw = PredictBatteryKw(spectra, at);
+
+        // Predicted generators/consumers/batteries over the next ForecastHorizonHours, one
+        // point per ForecastStepHours. Empty (not null) until every Generator and Consumer
+        // has been analyzed, so a `foreach` over it just does nothing in that case.
+        List<ForecastPoint> forecast = spectra is null
+            ? []
+            : BuildForecast(spectra, homeSystem.Generators.Select(g => g.Id).ToHashSet(), at, TimeSpan.FromHours(ForecastHorizonHours), TimeSpan.FromHours(ForecastStepHours));
 
         bool overloaded = acConsumption > inverter.MaxOutputPower;
         bool overgenerating = generatedKw > inverter.MaxDCInput;

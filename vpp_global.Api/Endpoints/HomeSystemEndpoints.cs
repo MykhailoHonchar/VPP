@@ -35,6 +35,28 @@ public static class HomeSystemEndpoints
             return Results.Ok();
         });
 
+        // Forecast net battery power over a time range (+discharge/-charge), from the same
+        // HomeSysLogic formula the live /status value uses. 404 until every Generator and
+        // Consumer on this HomeSystem has been analyzed — see LoadPredictionSpectraAsync.
+        app.MapGet("/home-systems/{homeSystemId:int}/predict-battery", async (int homeSystemId, DateTime from, DateTime to, int? stepMinutes, VppDbContext db, CancellationToken ct) =>
+        {
+            var predictableDeviceIds = await db.Set<Device>()
+                .Where(d => d.HomeSystemId == homeSystemId && (d is Generator || d is Consumer))
+                .Select(d => d.Id)
+                .ToListAsync(ct);
+
+            var spectra = await HomeSysLogic.LoadPredictionSpectraAsync(db, predictableDeviceIds, ct);
+            if (spectra is null)
+                return Results.NotFound("Not every Generator/Consumer on this home system has been analyzed yet.");
+
+            var step = TimeSpan.FromMinutes(Math.Max(1, stepMinutes ?? 60));
+            var points = new List<object>();
+            for (var t = from; t <= to; t = t.Add(step))
+                points.Add(new { Timestamp = t, PredictedKw = HomeSysLogic.PredictBatteryKw(spectra, t) });
+
+            return Results.Ok(points);
+        });
+
         // One bundled payload for the /god debug page — every device on this HomeSystem
         // (with its Simulations) plus the grid node's price Simulations, in one request
         // instead of the half-dozen small ones the normal page makes. Projected in memory

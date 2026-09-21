@@ -70,7 +70,7 @@ public static class DeviceEndpoints
             return Results.Ok(spectrum);
         });
 
-        app.MapGet("/devices/{deviceId:int}/predict", async (int deviceId, int? days, DateTime? from, DateTime? to, VppDbContext db, CancellationToken ct) =>
+        app.MapGet("/devices/{deviceId:int}/predict", async (int deviceId, int? days, DateTime? from, DateTime? to, int? stepMinutes, VppDbContext db, CancellationToken ct) =>
         {
             var spectrum = await db.PowerSpectra
                 .Include(s => s.Components)
@@ -84,8 +84,10 @@ public static class DeviceEndpoints
             var since = from ?? DateTime.UtcNow.AddDays(-(days ?? 30));
             var until = to ?? DateTime.UtcNow;
 
+            // Hourly unless the caller asks for finer sampling (e.g. a smooth forecast curve).
+            var step = TimeSpan.FromMinutes(Math.Max(1, stepMinutes ?? 60));
             var points = new List<object>();
-            for (var t = since; t <= until; t = t.AddHours(1))
+            for (var t = since; t <= until; t = t.Add(step))
                 points.Add(new { Timestamp = t, PredictedKw = PowerPredictor.Predict(spectrum, t) });
 
             return Results.Ok(points);
